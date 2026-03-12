@@ -39,6 +39,7 @@
 #define ESTRPIPE EPIPE
 #endif
 
+int soundcard_reopen(struct pvt *pvt);
 
 static char silence_frame[FRAME_SIZE];
 
@@ -270,6 +271,14 @@ static int channel_call(struct ast_channel* channel, char* dest, attribute_unuse
 	}
 	CPVT_SET_FLAGS(cpvt, opts);
 
+	if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) {
+		if (soundcard_reopen(pvt) < 0) {
+			ast_mutex_unlock (&pvt->lock);
+			ast_log(LOG_ERROR, "[%s] Failed to reopen UAC sound card before call\n", PVT_ID(pvt));
+			return -1;
+		}
+	}
+
 	ast_debug (1, "[%s] Calling %s on %s\n", PVT_ID(pvt), dest, ast_channel_name(channel));
 
 	if (CONF_SHARED(pvt, usecallingpres))
@@ -315,8 +324,17 @@ static void disactivate_call(struct cpvt* cpvt)
 
 	if(cpvt->channel && CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
 	{
-                if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) snd_pcm_drop(pvt->icard);
-		else mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
+		if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) {
+			if (pvt->icard)
+				snd_pcm_drop(pvt->icard);
+			if (pvt->ocard) {
+				snd_pcm_drop(pvt->ocard);
+				snd_pcm_prepare(pvt->ocard);
+			}
+			pvt->uac_readpos = 0;
+			pvt->uac_readleft = FRAME_SIZE2;
+			pvt->uac_write_len = 0;
+		} else mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
 		ast_channel_set_fd (cpvt->channel, 1, -1);
 		ast_channel_set_fd (cpvt->channel, 0, -1);
 		CPVT_RESET_FLAGS(cpvt, CALL_FLAG_ACTIVATED | CALL_FLAG_MASTER);
@@ -364,14 +382,22 @@ static void activate_call(struct cpvt* cpvt)
 	{
 		// FIXME: reset possition?
 		if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) mixb_attach(&pvt->a_write_mixb, &cpvt->mixstream);
-                else {
-	        snd_pcm_state_t state;
-	        state = snd_pcm_state(pvt->icard);
-	        if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
-                snd_pcm_prepare(pvt->icard);
-                snd_pcm_start(pvt->icard);
-                                                                                            }
-                      }                
+		else {
+			snd_pcm_state_t state;
+			pvt->uac_readpos = 0;
+			pvt->uac_readleft = FRAME_SIZE2;
+			pvt->uac_write_len = 0;
+			state = snd_pcm_state(pvt->icard);
+			if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
+				snd_pcm_prepare(pvt->icard);
+				state = snd_pcm_state(pvt->icard);
+			}
+			if (state == SND_PCM_STATE_PREPARED)
+				snd_pcm_start(pvt->icard);
+			state = snd_pcm_state(pvt->ocard);
+			if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING))
+				snd_pcm_prepare(pvt->ocard);
+		}
 //		rb_init (&cpvt->a_write_rb, cpvt->a_write_buf, sizeof (cpvt->a_write_buf));
 //		cpvt->write = pvt->a_write_rb.write;
 //		cpvt->used = pvt->a_write_rb.used;
@@ -658,6 +684,32 @@ static void write_conference(struct pvt * pvt, const char * buffer, size_t lengt
 
 }
 
+static unsigned char uac_silence_buf[AST_FRIENDLY_OFFSET + FRAME_SIZE];
+
+static struct ast_frame *uac_make_silence_frame(struct cpvt *cpvt)
+{
+	memset(&cpvt->a_read_frame, 0, sizeof(cpvt->a_read_frame));
+
+	cpvt->a_read_frame.frametype = AST_FRAME_VOICE;
+#if ASTERISK_VERSION_NUM >= 130000
+	cpvt->a_read_frame.subclass.format = ast_format_slin;
+#elif ASTERISK_VERSION_NUM >= 100000
+	ast_format_copy(&cpvt->a_read_frame.subclass.format, &chan_quectel_format);
+#else
+	cpvt->a_read_frame.subclass_codec = AST_FORMAT_SLINEAR;
+#endif
+	cpvt->a_read_frame.samples = FRAME_SIZE2;
+	cpvt->a_read_frame.datalen = FRAME_SIZE;
+	cpvt->a_read_frame.data.ptr = uac_silence_buf + AST_FRIENDLY_OFFSET;
+	cpvt->a_read_frame.offset = AST_FRIENDLY_OFFSET;
+	cpvt->a_read_frame.src = AST_MODULE;
+	cpvt->a_read_frame.mallocd = 0;
+	cpvt->a_read_frame.delivery.tv_sec = 0;
+	cpvt->a_read_frame.delivery.tv_usec = 0;
+
+	return &cpvt->a_read_frame;
+}
+
 
 #if ASTERISK_VERSION_NUM >= 100000 /* 10+ */
 #define subclass_integer	subclass.integer
@@ -669,26 +721,26 @@ static void write_conference(struct pvt * pvt, const char * buffer, size_t lengt
 #define subclass_integer	subclass
 #endif /* ^1.8- */
 
-#/* */
-static struct ast_frame* channel_read (struct ast_channel* channel)
+static struct ast_frame* channel_read(struct ast_channel* channel)
 {
 	struct cpvt*		cpvt = ast_channel_tech_pvt(channel);
 	struct pvt*		pvt;
 	struct ast_frame*	f = &ast_null_frame;
 	ssize_t			res;
 
-	if(!cpvt || cpvt->channel != channel || !cpvt->pvt)
+	if (!cpvt || cpvt->channel != channel || !cpvt->pvt)
 	{
 		return f;
 	}
 	pvt = cpvt->pvt;
 
-	while (ast_mutex_trylock (&pvt->lock))
+	while (ast_mutex_trylock(&pvt->lock))
 	{
-		CHANNEL_DEADLOCK_AVOIDANCE (channel);
+		CHANNEL_DEADLOCK_AVOIDANCE(channel);
 	}
 
-	ast_debug (7, "[%s] read call idx %d state %d audio_fd %d\n", PVT_ID(pvt), cpvt->call_idx, cpvt->state, pvt->audio_fd);
+	ast_debug(7, "[%s] read call idx %d state %d audio_fd %d\n",
+		PVT_ID(pvt), cpvt->call_idx, cpvt->state, pvt->audio_fd);
 
 	/* FIXME: move down for enable timing_write() to device ? */
 	if (!CPVT_IS_SOUND_SOURCE(cpvt) || pvt->audio_fd < 0)
@@ -696,18 +748,234 @@ static struct ast_frame* channel_read (struct ast_channel* channel)
 		goto e_return;
 	}
 
-        if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) {
-
-	if (pvt->a_timer && ast_channel_fdno(channel) == 1)
+	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0)
 	{
-		ast_timer_ack (pvt->a_timer, 1);
-		timing_write (pvt);
-		ast_debug (7, "[%s] *** timing ***\n", PVT_ID(pvt));
-	}
+		if (pvt->a_timer && ast_channel_fdno(channel) == 1)
+		{
+			ast_timer_ack(pvt->a_timer, 1);
+			timing_write(pvt);
+			ast_debug(7, "[%s] *** timing ***\n", PVT_ID(pvt));
+		}
+		else
+		{
+			memset(&cpvt->a_read_frame, 0, sizeof(cpvt->a_read_frame));
 
+			cpvt->a_read_frame.frametype = AST_FRAME_VOICE;
+#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
+			cpvt->a_read_frame.subclass.format = ast_format_slin;
+#elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
+			ast_format_copy(&cpvt->a_read_frame.subclass.format, &chan_quectel_format);
+#else /* 10- */
+			cpvt->a_read_frame.subclass_codec = AST_FORMAT_SLINEAR;
+#endif /* ^10- */
+			cpvt->a_read_frame.data.ptr = cpvt->a_read_buf + AST_FRIENDLY_OFFSET;
+			cpvt->a_read_frame.offset = AST_FRIENDLY_OFFSET;
+			cpvt->a_read_frame.src = AST_MODULE;
+
+			res = read(CPVT_IS_MASTER(cpvt) ? pvt->audio_fd : cpvt->rd_pipe[PIPE_READ],
+				cpvt->a_read_frame.data.ptr, FRAME_SIZE);
+			if (res <= 0)
+			{
+				if (errno != EAGAIN && errno != EINTR)
+				{
+					ast_debug(1, "[%s] Read error %d, going to wait for new connection\n",
+						PVT_ID(pvt), errno);
+				}
+
+				goto e_return;
+			}
+
+			if (CPVT_IS_MASTER(cpvt))
+			{
+				if (CPVT_TEST_FLAG(cpvt, CALL_FLAG_MULTIPARTY))
+					write_conference(pvt, cpvt->a_read_frame.data.ptr, res);
+
+				PVT_STAT(pvt, a_read_bytes) += res;
+				PVT_STAT(pvt, read_frames)++;
+				if (res < FRAME_SIZE)
+					PVT_STAT(pvt, read_sframes)++;
+			}
+
+			cpvt->a_read_frame.samples = res / 2;
+			cpvt->a_read_frame.datalen = res;
+			ast_frame_byteswap_le(&cpvt->a_read_frame);
+
+			f = &cpvt->a_read_frame;
+			if (pvt->dsp)
+			{
+				f = ast_dsp_process(channel, pvt->dsp, f);
+				if ((f->frametype == AST_FRAME_DTMF_END) || (f->frametype == AST_FRAME_DTMF_BEGIN))
+				{
+					if ((f->subclass_integer == 'm') || (f->subclass_integer == 'u'))
+					{
+						f->frametype = AST_FRAME_NULL;
+						f->subclass_integer = 0;
+						goto e_return;
+					}
+					if (f->frametype == AST_FRAME_DTMF_BEGIN)
+					{
+						pvt->dtmf_begin_time = ast_tvnow();
+					}
+					else if (f->frametype == AST_FRAME_DTMF_END)
+					{
+						if (!ast_tvzero(pvt->dtmf_begin_time) &&
+							ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time) < CONF_SHARED(pvt, mindtmfgap))
+						{
+							ast_debug(1, "[%s] DTMF char %c ignored min gap %d > %ld\n",
+								PVT_ID(pvt), f->subclass_integer, CONF_SHARED(pvt, mindtmfgap),
+								(long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time));
+							f->frametype = AST_FRAME_NULL;
+							f->subclass_integer = 0;
+						}
+						else if (f->len < CONF_SHARED(pvt, mindtmfduration))
+						{
+							ast_debug(1, "[%s] DTMF char %c ignored min duration %d > %ld\n",
+								PVT_ID(pvt), f->subclass_integer, CONF_SHARED(pvt, mindtmfduration), f->len);
+							f->frametype = AST_FRAME_NULL;
+							f->subclass_integer = 0;
+						}
+						else if (f->subclass_integer == pvt->dtmf_digit &&
+								!ast_tvzero(pvt->dtmf_end_time) &&
+								ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time) < CONF_SHARED(pvt, mindtmfinterval))
+						{
+							ast_debug(1, "[%s] DTMF char %c ignored min interval %d > %ld\n",
+								PVT_ID(pvt), f->subclass_integer, CONF_SHARED(pvt, mindtmfinterval),
+								(long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time));
+							f->frametype = AST_FRAME_NULL;
+							f->subclass_integer = 0;
+						}
+						else
+						{
+							ast_debug(1, "[%s] Got DTMF char %c\n", PVT_ID(pvt), f->subclass_integer);
+							pvt->dtmf_digit = f->subclass_integer;
+							pvt->dtmf_end_time = ast_tvnow();
+						}
+					}
+					goto e_return;
+				}
+			}
+
+			if (CONF_SHARED(pvt, rxgain) && f->frametype == AST_FRAME_VOICE)
+			{
+				if (ast_frame_adjust_volume(f, CONF_SHARED(pvt, rxgain)) == -1)
+				{
+					ast_debug(1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
+				}
+			}
+		}
+
+e_return:
+		ast_mutex_unlock(&pvt->lock);
+		return f;
+	}
 	else
 	{
-		memset (&cpvt->a_read_frame, 0, sizeof (cpvt->a_read_frame));
+		short *buf;
+		snd_pcm_state_t state;
+		int r = 0;
+
+		memset(&cpvt->a_read_frame, 0, sizeof(cpvt->a_read_frame));
+		cpvt->a_read_frame.frametype = AST_FRAME_NULL;
+		cpvt->a_read_frame.samples = 0;
+		cpvt->a_read_frame.datalen = 0;
+		cpvt->a_read_frame.data.ptr = NULL;
+		cpvt->a_read_frame.offset = 0;
+		cpvt->a_read_frame.src = AST_MODULE;
+		cpvt->a_read_frame.mallocd = 0;
+		cpvt->a_read_frame.delivery.tv_sec = 0;
+		cpvt->a_read_frame.delivery.tv_usec = 0;
+
+		if (pvt->uac_readleft <= 0 || pvt->uac_readleft > FRAME_SIZE2)
+		{
+			pvt->uac_readpos = 0;
+			pvt->uac_readleft = FRAME_SIZE2;
+		}
+
+		state = snd_pcm_state(pvt->icard);
+		if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING))
+		{
+			r = snd_pcm_prepare(pvt->icard);
+			if (r < 0)
+			{
+				ast_log(LOG_ERROR, "Unable to prepare capture PCM: %s\n", snd_strerror(r));
+				pvt->uac_readpos = 0;
+				pvt->uac_readleft = FRAME_SIZE2;
+				{
+					struct ast_frame *sf = uac_make_silence_frame(cpvt);
+					ast_mutex_unlock(&pvt->lock);
+					return sf;
+				}
+			}
+
+			state = snd_pcm_state(pvt->icard);
+			if (state == SND_PCM_STATE_PREPARED)
+			{
+				r = snd_pcm_start(pvt->icard);
+				if (r < 0 && r != -EBUSY)
+				{
+					ast_log(LOG_ERROR, "Unable to start capture PCM: %s\n", snd_strerror(r));
+					pvt->uac_readpos = 0;
+					pvt->uac_readleft = FRAME_SIZE2;
+					{
+						struct ast_frame *sf = uac_make_silence_frame(cpvt);
+						ast_mutex_unlock(&pvt->lock);
+						return sf;
+					}
+				}
+			}
+		}
+
+		buf = (short *)(cpvt->a_read_buf + AST_FRIENDLY_OFFSET);
+
+		r = snd_pcm_readi(pvt->icard, buf + pvt->uac_readpos, pvt->uac_readleft);
+		if (r < 0)
+		{
+			if (r == -EAGAIN)
+			{
+				struct ast_frame *sf = uac_make_silence_frame(cpvt);
+				ast_mutex_unlock(&pvt->lock);
+				return sf;
+			}
+			else
+			{
+				int rec = snd_pcm_recover(pvt->icard, r, 1);
+
+				pvt->uac_readpos = 0;
+				pvt->uac_readleft = FRAME_SIZE2;
+
+				if (rec < 0)
+				{
+					ast_log(LOG_ERROR, "Read recover failed: read=%s recover=%s\n",
+						snd_strerror(r), snd_strerror(rec));
+				}
+
+				{
+					struct ast_frame *sf = uac_make_silence_frame(cpvt);
+					ast_mutex_unlock(&pvt->lock);
+					return sf;
+				}
+			}
+		}
+
+		if (r == 0)
+		{
+			struct ast_frame *sf = uac_make_silence_frame(cpvt);
+			ast_mutex_unlock(&pvt->lock);
+			return sf;
+		}
+
+		pvt->uac_readpos += r;
+		pvt->uac_readleft -= r;
+
+		if (pvt->uac_readpos < FRAME_SIZE2)
+		{
+			struct ast_frame *sf = uac_make_silence_frame(cpvt);
+			ast_mutex_unlock(&pvt->lock);
+			return sf;
+		}
+
+		pvt->uac_readpos = 0;
+		pvt->uac_readleft = FRAME_SIZE2;
 
 		cpvt->a_read_frame.frametype = AST_FRAME_VOICE;
 #if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
@@ -717,239 +985,81 @@ static struct ast_frame* channel_read (struct ast_channel* channel)
 #else /* 10- */
 		cpvt->a_read_frame.subclass_codec = AST_FORMAT_SLINEAR;
 #endif /* ^10- */
+		cpvt->a_read_frame.samples = FRAME_SIZE2;
+		cpvt->a_read_frame.datalen = FRAME_SIZE2 * 2;
 		cpvt->a_read_frame.data.ptr = cpvt->a_read_buf + AST_FRIENDLY_OFFSET;
 		cpvt->a_read_frame.offset = AST_FRIENDLY_OFFSET;
 		cpvt->a_read_frame.src = AST_MODULE;
+		cpvt->a_read_frame.mallocd = 0;
 
-		res = read (CPVT_IS_MASTER(cpvt) ? pvt->audio_fd : cpvt->rd_pipe[PIPE_READ], cpvt->a_read_frame.data.ptr, FRAME_SIZE);
-		if (res <= 0)
-		{
-			if (errno != EAGAIN && errno != EINTR)
-			{
-				ast_debug (1, "[%s] Read error %d, going to wait for new connection\n", PVT_ID(pvt), errno);
-			}
-
-			goto e_return;
-		}
-
-/*		ast_debug (7, "[%s] call idx %d read %u\n", PVT_ID(pvt), cpvt->call_idx, (unsigned)res);
-		ast_debug (6, "[%s] read | call idx %d fd %d read %d bytes\n", PVT_ID(pvt), cpvt->call_idx, pvt->audio_fd, res);
-*/
-
-		if(CPVT_IS_MASTER(cpvt))
-		{
-			if(CPVT_TEST_FLAG(cpvt, CALL_FLAG_MULTIPARTY))
-				write_conference(pvt, cpvt->a_read_frame.data.ptr, res);
-
-			PVT_STAT(pvt, a_read_bytes) += res;
-			PVT_STAT(pvt, read_frames) ++;
-			if(res < FRAME_SIZE)
-				PVT_STAT(pvt, read_sframes) ++;
-		}
-
-		cpvt->a_read_frame.samples	= res / 2;
-		cpvt->a_read_frame.datalen	= res;
-		ast_frame_byteswap_le (&cpvt->a_read_frame);
-/*
-		cpvt->a_read_frame.ts;
-		cpvt->a_read_frame.len;
-		cpvt->a_read_frame.seqno;
-*/
-		f = &cpvt->a_read_frame;
 		if (pvt->dsp)
 		{
-			f = ast_dsp_process (channel, pvt->dsp, f);
-			if ((f->frametype == AST_FRAME_DTMF_END) || (f->frametype == AST_FRAME_DTMF_BEGIN))
-			{
-				if ((f->subclass_integer == 'm') || (f->subclass_integer == 'u'))
-				{
-					f->frametype = AST_FRAME_NULL;
-					f->subclass_integer = 0;
-					goto e_return;
-				}
-				if(f->frametype == AST_FRAME_DTMF_BEGIN)
-				{
-					pvt->dtmf_begin_time = ast_tvnow();
-				}
-				else if (f->frametype == AST_FRAME_DTMF_END)
-				{
-					if(!ast_tvzero(pvt->dtmf_begin_time) && ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time) < CONF_SHARED(pvt, mindtmfgap))
-					{
-						ast_debug(1, "[%s] DTMF char %c ignored min gap %d > %ld\n", PVT_ID(pvt), f->subclass_integer, CONF_SHARED(pvt, mindtmfgap), (long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time));
-						f->frametype = AST_FRAME_NULL;
-						f->subclass_integer = 0;
-					}
-					else if(f->len < CONF_SHARED(pvt, mindtmfduration))
-					{
-						ast_debug(1, "[%s] DTMF char %c ignored min duration %d > %ld\n", PVT_ID(pvt), f->subclass_integer, CONF_SHARED(pvt, mindtmfduration), f->len);
-						f->frametype = AST_FRAME_NULL;
-						f->subclass_integer = 0;
-					}
-					else if(f->subclass_integer == pvt->dtmf_digit
-							&&
-						!ast_tvzero(pvt->dtmf_end_time)
-							&&
-						ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time) < CONF_SHARED(pvt, mindtmfinterval))
-					{
-						ast_debug(1, "[%s] DTMF char %c ignored min interval %d > %ld\n", PVT_ID(pvt), f->subclass_integer, CONF_SHARED(pvt, mindtmfinterval), (long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time));
-						f->frametype = AST_FRAME_NULL;
-						f->subclass_integer = 0;
-					}
-					else
-					{
-						ast_debug(1, "[%s] Got DTMF char %c\n",PVT_ID(pvt), f->subclass_integer);
-						pvt->dtmf_digit = f->subclass_integer;
-						pvt->dtmf_end_time = ast_tvnow();
-					}
-
-				}
-				goto e_return;
-			}
-		}
-
-		if (CONF_SHARED(pvt, rxgain) && f->frametype == AST_FRAME_VOICE)
-		{
-			if (ast_frame_adjust_volume (f, CONF_SHARED(pvt, rxgain)) == -1)
-			{
-				ast_debug (1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
-			}
-		}
-	}
-
-e_return:
-	ast_mutex_unlock (&pvt->lock);
-
-	return f;
-        }
-        else {
-	static struct ast_frame f;
-	static short __buf[FRAME_SIZE2 + AST_FRIENDLY_OFFSET / 2];
-	short *buf;
-	static int readpos = 0;
-	static int left = FRAME_SIZE2;
-	snd_pcm_state_t state;
-	int r = 0;
-
-	f.frametype = AST_FRAME_NULL;
-	f.subclass.integer = 0;
-	f.samples = 0;
-	f.datalen = 0;
-	f.data.ptr = NULL;
-	f.offset = 0;
-	f.src = AST_MODULE;
-	f.mallocd = 0;
-	f.delivery.tv_sec = 0;
-	f.delivery.tv_usec = 0;
-	state = snd_pcm_state(pvt->icard);
-	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
-		snd_pcm_prepare(pvt->icard);
-
-	}
-
-	buf = __buf + AST_FRIENDLY_OFFSET / 2;
-
-	r = snd_pcm_readi(pvt->icard, buf + readpos, left);
-	if (r == -EPIPE) {
-#if DEBUG
-		ast_log(LOG_ERROR, "XRUN read\n");
-#endif
-		snd_pcm_prepare(pvt->icard);
-	} else if (r == -ESTRPIPE) {
-		ast_log(LOG_ERROR, "-ESTRPIPE\n");
-		snd_pcm_prepare(pvt->icard);
-	} else if (r < 0) {
-		ast_log(LOG_ERROR, "Read error: %s\n", snd_strerror(r));
-	}
-
-	/* Return NULL frame on error */
-	if (r < 0) {
-		ast_mutex_unlock (&pvt->lock);
-		return &f;
-	}
-	readpos += r;
-	left -= r;
-
-	if (readpos >= FRAME_SIZE2) {
-		/* A real frame */
-		readpos = 0;
-		left = FRAME_SIZE2;
-#if 0
-                if (ast_channel_state(channel) != AST_STATE_UP){
-			/* Don't transmit unless it's up */
-			ast_mutex_unlock(&pvt->lock);
-			return &f;
-		}
-#endif
-		f.frametype = AST_FRAME_VOICE;
-		f.subclass.format = ast_format_slin;
-		f.samples = FRAME_SIZE2;
-		f.datalen = FRAME_SIZE2 * 2;
-		f.data.ptr = buf;
-		f.offset = AST_FRIENDLY_OFFSET;
-		f.src = AST_MODULE;
-		f.mallocd = 0;
-		if (pvt->dsp)
-		{
-                        struct ast_frame*	p;
-			p = ast_dsp_process (channel, pvt->dsp, &f);
+			struct ast_frame *p;
+			p = ast_dsp_process(channel, pvt->dsp, &cpvt->a_read_frame);
 			if ((p->frametype == AST_FRAME_DTMF_END) || (p->frametype == AST_FRAME_DTMF_BEGIN))
 			{
 				if ((p->subclass_integer == 'm') || (p->subclass_integer == 'u'))
 				{
 					p->frametype = AST_FRAME_NULL;
 					p->subclass_integer = 0;
-						ast_mutex_unlock (&pvt->lock);
-
-	                                        return p;
+					ast_mutex_unlock(&pvt->lock);
+					return p;
 				}
-				if(p->frametype == AST_FRAME_DTMF_BEGIN)
+				if (p->frametype == AST_FRAME_DTMF_BEGIN)
 				{
 					pvt->dtmf_begin_time = ast_tvnow();
 				}
 				else if (p->frametype == AST_FRAME_DTMF_END)
 				{
-					if(!ast_tvzero(pvt->dtmf_begin_time) && ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time) < CONF_SHARED(pvt, mindtmfgap))
+					if (!ast_tvzero(pvt->dtmf_begin_time) &&
+						ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time) < CONF_SHARED(pvt, mindtmfgap))
 					{
-						ast_debug(1, "[%s] DTMF char %c ignored min gap %d > %ld\n", PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfgap), (long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time));
+						ast_debug(1, "[%s] DTMF char %c ignored min gap %d > %ld\n",
+							PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfgap),
+							(long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time));
 						p->frametype = AST_FRAME_NULL;
 						p->subclass_integer = 0;
 					}
-					else if(p->len < CONF_SHARED(pvt, mindtmfduration))
+					else if (p->len < CONF_SHARED(pvt, mindtmfduration))
 					{
-						ast_debug(1, "[%s] DTMF char %c ignored min duration %d > %ld\n", PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfduration), p->len);
+						ast_debug(1, "[%s] DTMF char %c ignored min duration %d > %ld\n",
+							PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfduration), p->len);
 						p->frametype = AST_FRAME_NULL;
 						p->subclass_integer = 0;
 					}
-					else if(p->subclass_integer == pvt->dtmf_digit
-							&&
-						!ast_tvzero(pvt->dtmf_end_time)
-							&&
-						ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time) < CONF_SHARED(pvt, mindtmfinterval))
+					else if (p->subclass_integer == pvt->dtmf_digit &&
+							!ast_tvzero(pvt->dtmf_end_time) &&
+							ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time) < CONF_SHARED(pvt, mindtmfinterval))
 					{
-						ast_debug(1, "[%s] DTMF char %c ignored min interval %d > %ld\n", PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfinterval), (long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time));
+						ast_debug(1, "[%s] DTMF char %c ignored min interval %d > %ld\n",
+							PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfinterval),
+							(long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time));
 						p->frametype = AST_FRAME_NULL;
 						p->subclass_integer = 0;
 					}
 					else
 					{
-						ast_debug(1, "[%s] Got DTMF char %c\n",PVT_ID(pvt), p->subclass_integer);
+						ast_debug(1, "[%s] Got DTMF char %c\n", PVT_ID(pvt), p->subclass_integer);
 						pvt->dtmf_digit = p->subclass_integer;
 						pvt->dtmf_end_time = ast_tvnow();
 					}
-
 				}
-					ast_mutex_unlock (&pvt->lock);
-
-	                                return p;
+				ast_mutex_unlock(&pvt->lock);
+				return p;
 			}
 		}
+
+		if (CONF_SHARED(pvt, rxgain) && cpvt->a_read_frame.frametype == AST_FRAME_VOICE)
+		{
+			if (ast_frame_adjust_volume(&cpvt->a_read_frame, CONF_SHARED(pvt, rxgain)) == -1)
+			{
+				ast_debug(1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
+			}
+		}
+
+		ast_mutex_unlock(&pvt->lock);
+		return &cpvt->a_read_frame;
 	}
-
-	ast_mutex_unlock (&pvt->lock);
-
-	return &f;
-        }
-
 }
 
 #/* */
@@ -1133,53 +1243,54 @@ e_return:
 	return 0;
              }
         else {
-	static char sizbuf[8000];
-	static int sizpos = 0;
-	int len = sizpos;
 	int res = 0;
-	/* size_t frames = 0; */
-	snd_pcm_state_t state;
-
 
 	while (ast_mutex_trylock (&pvt->lock))
 	{
 		CHANNEL_DEADLOCK_AVOIDANCE (channel);
 	}
-	if (f->datalen > sizeof(sizbuf) - sizpos) {
+
+	if (f->datalen > sizeof(pvt->a_write_buf)) {
 		ast_log(LOG_WARNING, "Frame too large\n");
 		res = -1;
-	} else {
-		memcpy(sizbuf + sizpos, f->data.ptr, f->datalen);
-		len += f->datalen;
-		state = snd_pcm_state(pvt->ocard);
-		if (state == SND_PCM_STATE_XRUN)
-			snd_pcm_prepare(pvt->ocard);
-		while ((res = snd_pcm_writei(pvt->ocard, sizbuf, len / 2)) == -EAGAIN) {
-			usleep(1);
-		}
-		if (res == -EPIPE) {
-#if DEBUG
-			ast_debug(1, "XRUN write\n");
-#endif
-			snd_pcm_prepare(pvt->ocard);
-			while ((res = snd_pcm_writei(pvt->ocard, sizbuf, len / 2)) == -EAGAIN) {
-				usleep(1);
-			}
-			if (res != len / 2) {
-				ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(res));
-				res = -1;
-			} else if (res < 0) {
-				ast_log(LOG_ERROR, "Write error %s\n", snd_strerror(res));
-				res = -1;
-			}
-		} else {
-			if (res == -ESTRPIPE)
-				ast_log(LOG_ERROR, "You've got some big problems\n");
-			else if (res < 0)
-				ast_log(LOG_NOTICE, "Error %d on write\n", res);
-		}
+		goto uac_write_done;
 	}
 
+	if (f->datalen > (ssize_t)(sizeof(pvt->a_write_buf) - pvt->uac_write_len)) {
+		ast_debug(1, "[%s] Dropping stale buffered uplink audio (%zu bytes)\n", PVT_ID(pvt), pvt->uac_write_len);
+		pvt->uac_write_len = 0;
+	}
+
+	memcpy(pvt->a_write_buf + pvt->uac_write_len, f->data.ptr, f->datalen);
+	pvt->uac_write_len += f->datalen;
+
+	while (pvt->uac_write_len > 0) {
+		snd_pcm_state_t state = snd_pcm_state(pvt->ocard);
+
+		if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING))
+			snd_pcm_prepare(pvt->ocard);
+
+		res = snd_pcm_writei(pvt->ocard, pvt->a_write_buf, pvt->uac_write_len / 2);
+		if (res == -EAGAIN)
+			break;
+		if (res < 0) {
+			int rec = snd_pcm_recover(pvt->ocard, res, 1);
+			if (rec < 0) {
+				ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(res));
+				res = rec;
+				break;
+			}
+			continue;
+		}
+		if (res == 0)
+			break;
+
+		if ((size_t)(res * 2) < pvt->uac_write_len)
+			memmove(pvt->a_write_buf, pvt->a_write_buf + (res * 2), pvt->uac_write_len - (res * 2));
+		pvt->uac_write_len -= res * 2;
+	}
+
+uac_write_done:
 	ast_mutex_unlock (&pvt->lock);
 
 	return res >= 0 ? 0 : res;
