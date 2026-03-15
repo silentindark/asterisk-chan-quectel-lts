@@ -815,6 +815,81 @@ static void uac_fade_frame(char *frame, unsigned int plc_left)
 		samples[i] = (short)((samples[i] * mul) / div);
 }
 
+static unsigned int uac_abs_sample(int v)
+{
+	return (v < 0) ? (unsigned int)(-v) : (unsigned int)v;
+}
+
+static unsigned int uac_edge_peak(const short *samples, unsigned int count)
+{
+	unsigned int i;
+	unsigned int peak = 0;
+
+	for (i = 0; i < count; ++i) {
+		unsigned int v = uac_abs_sample((int)samples[i]);
+		if (v > peak)
+			peak = v;
+	}
+
+	return peak;
+}
+
+static unsigned int uac_edge_mean_delta(const short *tail, const short *head, unsigned int count)
+{
+	unsigned int i;
+	unsigned int sum = 0;
+
+	for (i = 0; i < count; ++i)
+		sum += uac_abs_sample((int)head[i] - (int)tail[i]);
+
+	return count ? ((sum + count - 1) / count) : 0;
+}
+
+static void uac_crossfade_edges(const char *prev_frame, char *frame, unsigned int samples)
+{
+	const short *prev = (const short *)prev_frame;
+	short *cur = (short *)frame;
+	unsigned int i;
+
+	if (samples > FRAME_SIZE2)
+		samples = FRAME_SIZE2;
+
+	for (i = 0; i < samples; ++i) {
+		unsigned int prev_w = samples - i;
+		unsigned int cur_w = i + 1;
+		cur[i] = (short)(((int)prev[FRAME_SIZE2 - samples + i] * (int)prev_w +
+			(int)cur[i] * (int)cur_w) / (int)(samples + 1));
+	}
+}
+
+static void uac_sanitize_edge_from_prev(const char *prev_frame, char *frame, int aggressive)
+{
+	const short *prev = (const short *)prev_frame;
+	short *cur = (short *)frame;
+	unsigned int window = aggressive ? 32U : 16U;
+	unsigned int tail_peak;
+	unsigned int head_peak;
+	unsigned int scale;
+	unsigned int edge_delta;
+	unsigned int mean_delta;
+
+	if (window > FRAME_SIZE2)
+		window = FRAME_SIZE2;
+
+	tail_peak = uac_edge_peak(prev + (FRAME_SIZE2 - window), window);
+	head_peak = uac_edge_peak(cur, window);
+	scale = (tail_peak > head_peak) ? tail_peak : head_peak;
+	if (scale < 256U)
+		scale = 256U;
+
+	edge_delta = uac_abs_sample((int)cur[0] - (int)prev[FRAME_SIZE2 - 1]);
+	mean_delta = uac_edge_mean_delta(prev + (FRAME_SIZE2 - window), cur, window);
+
+	if ((aggressive && (edge_delta > scale * 4U || mean_delta > scale * 3U)) ||
+	    (!aggressive && (edge_delta > scale * 6U || mean_delta > scale * 4U)))
+		uac_crossfade_edges(prev_frame, frame, window);
+}
+
 static void uac_fadein_frame(char *frame, unsigned int fade_left)
 {
 	short *samples = (short *)frame;
@@ -861,17 +936,32 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 	memset(frame, 0, sizeof(frame));
 	memcpy(frame, data, copy);
 
+	if (pvt->uac_have_last_tx)
+		uac_sanitize_edge_from_prev(pvt->uac_last_tx_frame, frame, pvt->uac_tx_plc_left != 0);
+
 	while (rb_free(&pvt->uac_tx_rb) < FRAME_SIZE)
 		rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
 	rb_write(&pvt->uac_tx_rb, frame, FRAME_SIZE);
 	uac_trim_queue(&pvt->uac_tx_rb, keep);
+
+	memcpy(pvt->uac_last_tx_frame, frame, FRAME_SIZE);
+	pvt->uac_have_last_tx = 1;
 }
 
-static void uac_queue_rx_frame(struct pvt *pvt, const void *data)
+static void uac_queue_rx_frame(struct pvt *pvt, void *data)
 {
+	char *frame = (char *)data;
+	int aggressive = (pvt->uac_rx_fadein_left != 0 || pvt->uac_rx_plc_left != 0);
+
+	if (pvt->uac_have_last_rx)
+		uac_sanitize_edge_from_prev(pvt->uac_last_rx_frame, frame, aggressive);
+
 	while (rb_free(&pvt->uac_rx_rb) < FRAME_SIZE)
 		rb_read_upd(&pvt->uac_rx_rb, FRAME_SIZE);
 	rb_write(&pvt->uac_rx_rb, data, FRAME_SIZE);
+
+	memcpy(pvt->uac_last_rx_frame, frame, FRAME_SIZE);
+	pvt->uac_have_last_rx = 1;
 }
 
 static int uac_capture_drain(struct pvt *pvt)
@@ -954,8 +1044,6 @@ static int uac_capture_drain(struct pvt *pvt)
 		pvt->uac_readleft -= r;
 		if (pvt->uac_readleft == 0) {
 			uac_queue_rx_frame(pvt, pvt->uac_rx_assem_buf);
-			memcpy(pvt->uac_last_rx_frame, pvt->uac_rx_assem_buf, FRAME_SIZE);
-			pvt->uac_have_last_rx = 1;
 			pvt->uac_rx_plc_left = 2;
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
