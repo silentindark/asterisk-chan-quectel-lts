@@ -721,11 +721,69 @@ static struct ast_frame *uac_make_silence_frame(struct cpvt *cpvt)
 	return &cpvt->a_read_frame;
 }
 
+static unsigned int uac_queue_capacity_frames(const struct pvt *pvt)
+{
+	unsigned int tx = sizeof(pvt->uac_tx_buf) / FRAME_SIZE;
+	unsigned int rx = sizeof(pvt->uac_rx_buf) / FRAME_SIZE;
+
+	return (tx < rx) ? tx : rx;
+}
+
+static unsigned int uac_target_ceiling(const struct pvt *pvt)
+{
+	unsigned int limit = uac_queue_capacity_frames(pvt);
+	unsigned int pcm_limit;
+
+	if (limit > 2)
+		limit -= 2;
+
+	if (pvt->uac_capture_buffer > FRAME_SIZE2) {
+		pcm_limit = (unsigned int)(pvt->uac_capture_buffer / FRAME_SIZE2);
+		if (pcm_limit > 2) {
+			pcm_limit /= 2;
+			if (pcm_limit < limit)
+				limit = pcm_limit;
+		}
+	}
+
+	if (pvt->uac_playback_buffer > FRAME_SIZE2) {
+		pcm_limit = (unsigned int)(pvt->uac_playback_buffer / FRAME_SIZE2);
+		if (pcm_limit > 2) {
+			pcm_limit /= 2;
+			if (pcm_limit < limit)
+				limit = pcm_limit;
+		}
+	}
+
+	if (limit < 3)
+		limit = 3;
+
+	return limit;
+}
+
+static snd_pcm_uframes_t uac_pcm_target_fill(const struct pvt *pvt)
+{
+	snd_pcm_uframes_t period = pvt->uac_playback_period ? pvt->uac_playback_period : FRAME_SIZE2;
+	snd_pcm_uframes_t buffer = pvt->uac_playback_buffer ? pvt->uac_playback_buffer : (period * 4);
+	snd_pcm_uframes_t want;
+
+	want = period * (pvt->uac_target_frames ? pvt->uac_target_frames : 1);
+	if (want < period)
+		want = period;
+	if (buffer > period && want > buffer - period)
+		want = buffer - period;
+	if (want < period)
+		want = period;
+
+	return want;
+}
+
 static void uac_raise_target(struct pvt *pvt, const char *reason)
 {
 	unsigned int old = pvt->uac_target_frames;
+	unsigned int ceiling = uac_target_ceiling(pvt);
 
-	if (pvt->uac_target_frames < 3)
+	if (pvt->uac_target_frames < ceiling)
 		pvt->uac_target_frames++;
 	pvt->uac_stable_ticks = 0;
 	if (old != pvt->uac_target_frames)
@@ -757,6 +815,16 @@ static void uac_fade_frame(char *frame, unsigned int plc_left)
 		samples[i] = (short)((samples[i] * mul) / div);
 }
 
+static void uac_fadein_frame(char *frame, unsigned int fade_left)
+{
+	short *samples = (short *)frame;
+	unsigned int i;
+	int mul = (fade_left >= 2) ? 1 : 3;
+	int div = (fade_left >= 2) ? 2 : 4;
+
+	for (i = 0; i < FRAME_SIZE2; ++i)
+		samples[i] = (short)((samples[i] * mul) / div);
+}
 static void uac_trim_queue(struct ringbuffer *rb, size_t keep_bytes)
 {
 	if (keep_bytes < FRAME_SIZE)
@@ -779,6 +847,7 @@ static void uac_reset_runtime(struct pvt *pvt)
 	pvt->uac_have_last_rx = 0;
 	pvt->uac_tx_plc_left = 0;
 	pvt->uac_rx_plc_left = 0;
+	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
 }
@@ -787,7 +856,7 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 {
 	char frame[FRAME_SIZE];
 	size_t copy = len > FRAME_SIZE ? FRAME_SIZE : len;
-	size_t keep = (size_t)(pvt->uac_target_frames + 1) * FRAME_SIZE;
+	size_t keep = (size_t)(pvt->uac_target_frames + 2) * FRAME_SIZE;
 
 	memset(frame, 0, sizeof(frame));
 	memcpy(frame, data, copy);
@@ -800,20 +869,26 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 
 static void uac_queue_rx_frame(struct pvt *pvt, const void *data)
 {
-	size_t keep = (size_t)(pvt->uac_target_frames + 1) * FRAME_SIZE;
-
 	while (rb_free(&pvt->uac_rx_rb) < FRAME_SIZE)
 		rb_read_upd(&pvt->uac_rx_rb, FRAME_SIZE);
 	rb_write(&pvt->uac_rx_rb, data, FRAME_SIZE);
-	uac_trim_queue(&pvt->uac_rx_rb, keep);
 }
 
 static int uac_capture_drain(struct pvt *pvt)
 {
 	int loops = 0;
 	int degraded = 0;
+	int max_loops = 8;
 
-	while (loops++ < 8) {
+	if (pvt->uac_capture_buffer > FRAME_SIZE2) {
+		unsigned int buffer_frames = (unsigned int)(pvt->uac_capture_buffer / FRAME_SIZE2);
+		if ((int)(buffer_frames + 2) > max_loops)
+			max_loops = (int)(buffer_frames + 2);
+	}
+	if (max_loops > 16)
+		max_loops = 16;
+
+	while (loops++ < max_loops) {
 		snd_pcm_state_t state;
 		snd_pcm_sframes_t avail;
 		snd_pcm_uframes_t want;
@@ -824,6 +899,7 @@ static int uac_capture_drain(struct pvt *pvt)
 			r = snd_pcm_prepare(pvt->icard);
 			if (r < 0) {
 				ast_log(LOG_ERROR, "Unable to prepare capture PCM: %s\n", snd_strerror(r));
+				pvt->uac_rx_fadein_left = 2;
 				uac_raise_target(pvt, "capture prepare");
 				return 1;
 			}
@@ -833,6 +909,7 @@ static int uac_capture_drain(struct pvt *pvt)
 			r = snd_pcm_start(pvt->icard);
 			if (r < 0 && r != -EBUSY) {
 				ast_log(LOG_ERROR, "Unable to start capture PCM: %s\n", snd_strerror(r));
+				pvt->uac_rx_fadein_left = 2;
 				uac_raise_target(pvt, "capture start");
 				return 1;
 			}
@@ -845,6 +922,7 @@ static int uac_capture_drain(struct pvt *pvt)
 			int rec = snd_pcm_recover(pvt->icard, (int)avail, 1);
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
+			pvt->uac_rx_fadein_left = 2;
 			if (rec < 0)
 				ast_log(LOG_ERROR, "Capture avail recover failed: %s\n", snd_strerror(rec));
 			uac_raise_target(pvt, "capture recover");
@@ -864,6 +942,7 @@ static int uac_capture_drain(struct pvt *pvt)
 			int rec = snd_pcm_recover(pvt->icard, r, 1);
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
+			pvt->uac_rx_fadein_left = 2;
 			if (rec < 0)
 				ast_log(LOG_ERROR, "Read recover failed: read=%s recover=%s\n",
 					snd_strerror(r), snd_strerror(rec));
@@ -886,12 +965,18 @@ static int uac_capture_drain(struct pvt *pvt)
 	return degraded;
 }
 
+
+
 static int uac_playback_tick(struct pvt *pvt)
 {
 	char frame[FRAME_SIZE];
 	int degraded = 0;
 	snd_pcm_state_t state;
 	snd_pcm_sframes_t avail;
+	snd_pcm_uframes_t queued = 0;
+	snd_pcm_uframes_t want_fill;
+	unsigned int loops = 0;
+	unsigned int max_loops;
 
 	state = snd_pcm_state(pvt->ocard);
 	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
@@ -904,7 +989,7 @@ static int uac_playback_tick(struct pvt *pvt)
 	}
 
 	avail = snd_pcm_avail_update(pvt->ocard);
-	if (avail == -EAGAIN || avail < FRAME_SIZE2)
+	if (avail == -EAGAIN)
 		return 0;
 	if (avail < 0) {
 		int rec = snd_pcm_recover(pvt->ocard, (int)avail, 1);
@@ -914,36 +999,53 @@ static int uac_playback_tick(struct pvt *pvt)
 		return 1;
 	}
 
-	if (rb_used(&pvt->uac_tx_rb) >= FRAME_SIZE) {
-		struct iovec iov[2];
-		int iovcnt = rb_read_n_iov(&pvt->uac_tx_rb, iov, FRAME_SIZE);
-		if (iovcnt == 2) {
-			memcpy(frame, iov[0].iov_base, iov[0].iov_len);
-			memcpy(frame + iov[0].iov_len, iov[1].iov_base, iov[1].iov_len);
-		} else if (iovcnt == 1) {
-			memcpy(frame, iov[0].iov_base, FRAME_SIZE);
+	if (pvt->uac_playback_buffer && (snd_pcm_uframes_t)avail <= pvt->uac_playback_buffer)
+		queued = pvt->uac_playback_buffer - (snd_pcm_uframes_t)avail;
+	want_fill = uac_pcm_target_fill(pvt);
+	max_loops = (unsigned int)(want_fill / FRAME_SIZE2);
+	if (max_loops < 1)
+		max_loops = 1;
+	if (max_loops > 6)
+		max_loops = 6;
+
+	while (loops++ < max_loops) {
+		const char *ptr;
+		snd_pcm_uframes_t left;
+
+		if (queued >= want_fill && rb_used(&pvt->uac_tx_rb) < FRAME_SIZE)
+			break;
+		if (pvt->uac_playback_buffer && queued + FRAME_SIZE2 > pvt->uac_playback_buffer)
+			break;
+
+		if (rb_used(&pvt->uac_tx_rb) >= FRAME_SIZE) {
+			struct iovec iov[2];
+			int iovcnt = rb_read_n_iov(&pvt->uac_tx_rb, iov, FRAME_SIZE);
+			if (iovcnt == 2) {
+				memcpy(frame, iov[0].iov_base, iov[0].iov_len);
+				memcpy(frame + iov[0].iov_len, iov[1].iov_base, iov[1].iov_len);
+			} else if (iovcnt == 1) {
+				memcpy(frame, iov[0].iov_base, FRAME_SIZE);
+			} else {
+				memset(frame, 0, sizeof(frame));
+			}
+			rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
+			memcpy(pvt->uac_last_tx_frame, frame, FRAME_SIZE);
+			pvt->uac_have_last_tx = 1;
+			pvt->uac_tx_plc_left = 2;
+		} else if (pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
+			memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
+			uac_fade_frame(frame, pvt->uac_tx_plc_left);
+			pvt->uac_tx_plc_left--;
+			uac_raise_target(pvt, "tx underrun");
+			degraded = 1;
 		} else {
 			memset(frame, 0, sizeof(frame));
+			uac_raise_target(pvt, "tx silence");
+			degraded = 1;
 		}
-		rb_read_upd(&pvt->uac_tx_rb, FRAME_SIZE);
-		memcpy(pvt->uac_last_tx_frame, frame, FRAME_SIZE);
-		pvt->uac_have_last_tx = 1;
-		pvt->uac_tx_plc_left = 2;
-	} else if (pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
-		memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
-		uac_fade_frame(frame, pvt->uac_tx_plc_left);
-		pvt->uac_tx_plc_left--;
-		uac_raise_target(pvt, "tx underrun");
-		degraded = 1;
-	} else {
-		memset(frame, 0, sizeof(frame));
-		uac_raise_target(pvt, "tx silence");
-		degraded = 1;
-	}
 
-	{
-		const char *ptr = frame;
-		size_t left = FRAME_SIZE2;
+		ptr = frame;
+		left = FRAME_SIZE2;
 		while (left > 0) {
 			int r = snd_pcm_writei(pvt->ocard, ptr, left);
 			if (r == -EAGAIN)
@@ -957,13 +1059,18 @@ static int uac_playback_tick(struct pvt *pvt)
 			}
 			if (r == 0)
 				break;
-			left -= r;
+			left -= (snd_pcm_uframes_t)r;
 			ptr += r * 2;
 		}
+		if (left > 0)
+			break;
+		queued += FRAME_SIZE2;
 	}
 
 	return degraded;
 }
+
+
 
 static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, int *degraded)
 {
@@ -983,13 +1090,23 @@ static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, i
 			memset(frame, 0, sizeof(frame));
 		}
 		rb_read_upd(&pvt->uac_rx_rb, FRAME_SIZE);
+		if (pvt->uac_rx_fadein_left > 0) {
+			uac_fadein_frame(frame, pvt->uac_rx_fadein_left);
+			pvt->uac_rx_fadein_left--;
+		}
+		if (rb_used(&pvt->uac_rx_rb) > (size_t)(pvt->uac_target_frames + 2) * FRAME_SIZE) {
+			rb_read_upd(&pvt->uac_rx_rb, FRAME_SIZE);
+			*degraded = 1;
+		}
 	} else if (pvt->uac_have_last_rx && pvt->uac_rx_plc_left > 0) {
 		memcpy(frame, pvt->uac_last_rx_frame, FRAME_SIZE);
 		uac_fade_frame(frame, pvt->uac_rx_plc_left);
 		pvt->uac_rx_plc_left--;
+		pvt->uac_rx_fadein_left = 2;
 		uac_raise_target(pvt, "rx underrun");
 		*degraded = 1;
 	} else {
+		pvt->uac_rx_fadein_left = 2;
 		uac_raise_target(pvt, "rx silence");
 		*degraded = 1;
 		return uac_make_silence_frame(cpvt);
@@ -1016,6 +1133,8 @@ static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, i
 
 	return &cpvt->a_read_frame;
 }
+
+
 
 #if ASTERISK_VERSION_NUM >= 100000 /* 10+ */
 #define subclass_integer	subclass.integer

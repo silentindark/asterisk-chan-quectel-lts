@@ -175,7 +175,7 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,struct pvt *
 	if (err < 0)
 		ast_log(LOG_ERROR, "start threshold: %s\n", snd_strerror(err));
 
-	avail_min = DESIRED_RATE / 50;
+	avail_min = period_size ? period_size : (DESIRED_RATE / 50);
 	err = snd_pcm_sw_params_set_avail_min(handle, swparams, avail_min);
 	if (err < 0)
 		ast_log(LOG_ERROR, "avail_min: %s\n", snd_strerror(err));
@@ -248,6 +248,7 @@ static int soundcard_init(struct pvt * pvt)
 	pvt->uac_have_last_rx = 0;
 	pvt->uac_tx_plc_left = 0;
 	pvt->uac_rx_plc_left = 0;
+	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
 	snd_pcm_prepare(pvt->icard);
@@ -285,6 +286,7 @@ int soundcard_reopen(struct pvt *pvt)
 	pvt->uac_have_last_rx = 0;
 	pvt->uac_tx_plc_left = 0;
 	pvt->uac_rx_plc_left = 0;
+	pvt->uac_rx_fadein_left = 0;
 	pvt->uac_target_frames = 1;
 	pvt->uac_stable_ticks = 0;
 

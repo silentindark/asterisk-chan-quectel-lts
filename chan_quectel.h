@@ -166,7 +166,8 @@ typedef struct pvt
 	unsigned int	uac_have_last_rx:1;		/*!< downlink PLC history available */
 	unsigned int	uac_tx_plc_left:2;		/*!< remaining uplink PLC frames */
 	unsigned int	uac_rx_plc_left:2;		/*!< remaining downlink PLC frames */
-	unsigned int	uac_target_frames:2;		/*!< adaptive target buffering depth, in 20ms frames */
+	unsigned int	uac_rx_fadein_left:2;		/*!< fade-in frames after RX gap/recovery */
+	unsigned int	uac_target_frames:3;		/*!< adaptive target buffering depth, in 20ms frames */
 	unsigned int	uac_stable_ticks;		/*!< consecutive stable 20ms ticks */
 	snd_pcm_uframes_t	uac_capture_period;		/*!< negotiated UAC capture period size */
 	snd_pcm_uframes_t	uac_capture_buffer;		/*!< negotiated UAC capture buffer size */
