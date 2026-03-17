@@ -44,6 +44,27 @@ static char silence_frame[FRAME_SIZE];
 static void uac_reset_runtime(struct pvt *pvt);
 static void uac_diag_reset(struct pvt *pvt);
 static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char *reason);
+static void uac_diag_mark_answered(struct pvt *pvt, struct cpvt *cpvt, const char *reason);
+static void uac_diag_note_rx_enqueue(struct pvt *pvt);
+static void uac_diag_log_summary_once(struct pvt *pvt, struct cpvt *cpvt, const char *reason);
+static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, struct ast_frame *out);
+
+#define UAC_DIAG_SUMMARY_LEVEL 2
+#define UAC_DIAG_EVENT_LEVEL 3
+#define UAC_DIAG_DETAIL_LEVEL 4
+#define UAC_DIAG_GAP_DETAIL_MS 25U
+#define UAC_DIAG_GAP_EVENT_MS 60U
+#define UAC_DIAG_GAP_WARN_MS 250U
+#define UAC_DIAG_DTMF_WINDOW_MS 1500U
+
+#define UAC_DIAG_RX_KIND_NORMAL  0
+#define UAC_DIAG_RX_KIND_PLC     1
+#define UAC_DIAG_RX_KIND_SILENCE 2
+
+#define UAC_DIAG_SUMMARY(pvt, fmt, ...) ast_verb(UAC_DIAG_SUMMARY_LEVEL, "[%s] UAC diag " fmt "\n", PVT_ID(pvt), ##__VA_ARGS__)
+#define UAC_DIAG_EVENT(pvt, fmt, ...)   ast_verb(UAC_DIAG_EVENT_LEVEL, "[%s] UAC diag " fmt "\n", PVT_ID(pvt), ##__VA_ARGS__)
+#define UAC_DIAG_DETAIL(pvt, fmt, ...)  ast_verb(UAC_DIAG_DETAIL_LEVEL, "[%s] UAC diag " fmt "\n", PVT_ID(pvt), ##__VA_ARGS__)
+#define UAC_DIAG_TRACE(pvt, lvl, fmt, ...) ast_debug(lvl, "[%s] UAC diag " fmt "\n", PVT_ID(pvt), ##__VA_ARGS__)
 
 #/* */
 static int parse_dial_string(char * dialstr, const char** number, int * opts)
@@ -431,14 +452,63 @@ static void activate_call(struct cpvt* cpvt)
 	}
 }
 
+static unsigned int uac_diag_ms_since_tv(struct timeval when)
+{
+	int ms;
+
+	if (ast_tvzero(when))
+		return 0;
+
+	ms = ast_tvdiff_ms(ast_tvnow(), when);
+	if (ms < 0)
+		ms = 0;
+	return (unsigned int)ms;
+}
+
+static int uac_diag_is_post_answer(struct pvt *pvt)
+{
+	return pvt->uac_diag_answered && !ast_tvzero(pvt->uac_diag_answer_time);
+}
+
+static int uac_diag_in_dtmf_window(struct pvt *pvt)
+{
+	unsigned int ms;
+
+	if (ast_tvzero(pvt->uac_diag_last_dtmf_begin))
+		return 0;
+
+	ms = uac_diag_ms_since_tv(pvt->uac_diag_last_dtmf_begin);
+	return ms <= UAC_DIAG_DTMF_WINDOW_MS;
+}
+
+static void uac_diag_mark_answered(struct pvt *pvt, struct cpvt *cpvt, const char *reason)
+{
+	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0)
+		return;
+
+	if (pvt->uac_diag_answered)
+		return;
+
+	pvt->uac_diag_answered = 1;
+	pvt->uac_diag_answer_time = ast_tvnow();
+	UAC_DIAG_EVENT(pvt, "call answered call_idx=%d reason=%s call_ms=%u",
+		cpvt ? cpvt->call_idx : -1, reason ? reason : "unknown",
+		uac_diag_ms_since_tv(pvt->uac_diag_call_start));
+}
+
 static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char *reason)
 {
 	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0)
 		return;
 
-	ast_verb(3,
-		"[%s] UAC diag summary reason=%s call_idx=%d dtmf_begin=%u dtmf_drop_pending=%u dtmf_send_ok=%u dtmf_send_ok_sys=%u dtmf_send_ok_late=%u dtmf_send_err=%u dtmf_send_err_sys=%u dtmf_send_err_late=%u tx_rb_drop=%u rx_rb_drop=%u capture_prepare=%u capture_start=%u capture_avail_recover=%u capture_read_recover=%u playback_prepare=%u playback_avail_recover=%u playback_write_recover=%u capture_degraded=%u playback_degraded=%u\n",
-		PVT_ID(pvt), reason ? reason : "unknown", cpvt ? cpvt->call_idx : -1,
+	UAC_DIAG_SUMMARY(pvt,
+		"summary core reason=%s call_idx=%d call_ms=%u answer_ms=%u answered=%u "
+		"dtmf_begin=%u dtmf_drop_pending=%u dtmf_send_ok=%u dtmf_send_ok_sys=%u dtmf_send_ok_late=%u "
+		"dtmf_send_err=%u dtmf_send_err_sys=%u dtmf_send_err_late=%u",
+		reason ? reason : "unknown", cpvt ? cpvt->call_idx : -1,
+		uac_diag_ms_since_tv(pvt->uac_diag_call_start),
+		uac_diag_ms_since_tv(pvt->uac_diag_answer_time),
+		pvt->uac_diag_answered ? 1U : 0U,
 		pvt->uac_diag_dtmf_begin,
 		pvt->uac_diag_dtmf_drop_pending,
 		pvt->uac_diag_dtmf_send_ok,
@@ -446,18 +516,91 @@ static void uac_diag_log_summary(struct pvt *pvt, struct cpvt *cpvt, const char 
 		pvt->uac_diag_dtmf_send_ok_late,
 		pvt->uac_diag_dtmf_send_err,
 		pvt->uac_diag_dtmf_send_err_sys,
-		pvt->uac_diag_dtmf_send_err_late,
+		pvt->uac_diag_dtmf_send_err_late);
+
+	UAC_DIAG_SUMMARY(pvt,
+		"summary tx tx_in=%u tx_gap_25ms=%u tx_gap_60ms=%u tx_gap_250ms=%u tx_gap_60ms_post_answer=%u "
+		"tx_gap_60ms_dtmf=%u tx_gap_max_ms=%u tx_rb_drop=%u tx_rb_empty_after_tx=%u tx_rb_empty_gap_60ms=%u "
+		"playback_degraded_after_tx=%u playback_plc_after_tx=%u playback_silence_after_tx=%u",
+		pvt->uac_diag_tx_frame_in,
+		pvt->uac_diag_tx_gap_25ms,
+		pvt->uac_diag_tx_gap_60ms,
+		pvt->uac_diag_tx_gap_250ms,
+		pvt->uac_diag_tx_gap_60ms_post_answer,
+		pvt->uac_diag_tx_gap_60ms_dtmf,
+		pvt->uac_diag_tx_gap_max_ms,
 		pvt->uac_diag_tx_rb_drop,
+		pvt->uac_diag_tx_rb_empty_after_tx,
+		pvt->uac_diag_tx_rb_empty_gap_60ms,
+		pvt->uac_diag_playback_degraded_after_tx,
+		pvt->uac_diag_playback_plc_after_tx,
+		pvt->uac_diag_playback_silence_after_tx);
+
+	UAC_DIAG_SUMMARY(pvt,
+		"summary rx rx_in=%u rx_gap_25ms=%u rx_gap_60ms=%u rx_gap_250ms=%u rx_gap_60ms_post_answer=%u "
+		"rx_gap_60ms_dtmf=%u rx_gap_max_ms=%u rx_rb_drop=%u rx_empty_after_rx=%u rx_empty_gap_60ms=%u "
+		"rx_plc=%u rx_silence=%u rx_plc_post_answer=%u rx_silence_post_answer=%u",
+		pvt->uac_diag_rx_frame_in,
+		pvt->uac_diag_rx_gap_25ms,
+		pvt->uac_diag_rx_gap_60ms,
+		pvt->uac_diag_rx_gap_250ms,
+		pvt->uac_diag_rx_gap_60ms_post_answer,
+		pvt->uac_diag_rx_gap_60ms_dtmf,
+		pvt->uac_diag_rx_gap_max_ms,
 		pvt->uac_diag_rx_rb_drop,
+		pvt->uac_diag_rx_empty_after_rx,
+		pvt->uac_diag_rx_empty_gap_60ms,
+		pvt->uac_diag_rx_plc_ticks,
+		pvt->uac_diag_rx_silence_ticks,
+		pvt->uac_diag_rx_plc_post_answer,
+		pvt->uac_diag_rx_silence_post_answer);
+
+	UAC_DIAG_SUMMARY(pvt,
+		"summary rxout rx_out=%u rx_out_gap_25ms=%u rx_out_gap_60ms=%u rx_out_gap_250ms=%u "
+		"rx_out_gap_60ms_post_answer=%u rx_out_gap_60ms_dtmf=%u rx_out_gap_max_ms=%u "
+		"rx_out_degraded=%u rx_out_plc=%u rx_out_silence=%u",
+		pvt->uac_diag_rx_out_frame_out,
+		pvt->uac_diag_rx_out_gap_25ms,
+		pvt->uac_diag_rx_out_gap_60ms,
+		pvt->uac_diag_rx_out_gap_250ms,
+		pvt->uac_diag_rx_out_gap_60ms_post_answer,
+		pvt->uac_diag_rx_out_gap_60ms_dtmf,
+		pvt->uac_diag_rx_out_gap_max_ms,
+		pvt->uac_diag_rx_out_degraded,
+		pvt->uac_diag_rx_out_plc,
+		pvt->uac_diag_rx_out_silence);
+
+	UAC_DIAG_SUMMARY(pvt,
+		"summary pcm capture_prepare=%u capture_start=%u capture_avail_recover=%u capture_read_recover=%u "
+		"capture_degraded=%u playback_prepare=%u playback_avail_recover=%u playback_write_recover=%u "
+		"playback_degraded=%u playback_plc=%u playback_silence=%u playback_short_write=%u "
+		"playback_degraded_dtmf=%u playback_plc_dtmf=%u playback_silence_dtmf=%u",
 		pvt->uac_diag_capture_prepare,
 		pvt->uac_diag_capture_start,
 		pvt->uac_diag_capture_avail_recover,
 		pvt->uac_diag_capture_read_recover,
+		pvt->uac_diag_capture_degraded_ticks,
 		pvt->uac_diag_playback_prepare,
 		pvt->uac_diag_playback_avail_recover,
 		pvt->uac_diag_playback_write_recover,
-		pvt->uac_diag_capture_degraded_ticks,
-		pvt->uac_diag_playback_degraded_ticks);
+		pvt->uac_diag_playback_degraded_ticks,
+		pvt->uac_diag_playback_plc_ticks,
+		pvt->uac_diag_playback_silence_ticks,
+		pvt->uac_diag_playback_short_write_breaks,
+		pvt->uac_diag_playback_degraded_dtmf,
+		pvt->uac_diag_playback_plc_dtmf,
+		pvt->uac_diag_playback_silence_dtmf);
+
+	UAC_DIAG_SUMMARY(pvt,
+		"summary last last_state=%u last_avail=%ld last_queued=%lu last_want=%lu last_tx_rb_frames=%u "
+		"last_left=%lu last_gap_ms=%u",
+		pvt->uac_diag_playback_last_state,
+		(long)pvt->uac_diag_playback_last_avail,
+		(unsigned long)pvt->uac_diag_playback_last_queued,
+		(unsigned long)pvt->uac_diag_playback_last_want_fill,
+		pvt->uac_diag_playback_last_tx_rb_frames,
+		(unsigned long)pvt->uac_diag_playback_last_left,
+		pvt->uac_diag_playback_last_gap_ms);
 }
 
 #/* we has 2 case of call this function, when local side want terminate call and when called for cleanup after remote side alreay terminate call, CEND received and cpvt destroyed */
@@ -485,7 +628,7 @@ static int channel_hangup (struct ast_channel* channel)
 		}
 
 		pvt->uac_diag_dtmf_drop_pending += at_queue_drop_pending_dtmf(pvt, cpvt);
-		uac_diag_log_summary(pvt, cpvt, "hangup");
+		uac_diag_log_summary_once(pvt, cpvt, "hangup");
 		disactivate_call (cpvt);
 
 		/* drop cpvt->channel reference */
@@ -523,6 +666,7 @@ static int channel_answer (struct ast_channel* channel)
 		{
 			ast_log (LOG_ERROR, "[%s] Error sending answer commands\n", PVT_ID(pvt));
 		}
+		uac_diag_mark_answered(pvt, cpvt, "local answer");
 	}
 
 	ast_mutex_unlock (&pvt->lock);
@@ -552,8 +696,9 @@ static int channel_digit_begin (struct ast_channel* channel, char digit)
 		if (pvt->uac_target_frames < 2)
 			pvt->uac_target_frames = 2;
 		pvt->uac_stable_ticks = 0;
-		ast_verb(3, "[%s] UAC diag DTMF begin digit=%c call_idx=%d target=%u\n",
-			PVT_ID(pvt), digit, cpvt->call_idx, pvt->uac_target_frames);
+		pvt->uac_diag_last_dtmf_begin = ast_tvnow();
+		UAC_DIAG_EVENT(pvt, "DTMF begin digit=%c call_idx=%d target=%u",
+			digit, cpvt->call_idx, pvt->uac_target_frames);
 	}
 
 	rv = at_enqueue_dtmf(cpvt, digit);
@@ -814,6 +959,227 @@ static snd_pcm_uframes_t uac_pcm_target_fill(const struct pvt *pvt)
 	return want;
 }
 
+static void uac_diag_log_summary_once(struct pvt *pvt, struct cpvt *cpvt, const char *reason)
+{
+	if (pvt->uac_diag_summary_logged)
+		return;
+	pvt->uac_diag_summary_logged = 1;
+	uac_diag_log_summary(pvt, cpvt, reason);
+}
+
+static unsigned int uac_diag_ms_since_last_tx(struct pvt *pvt)
+{
+	int ms;
+
+	if (!pvt->uac_diag_tx_started)
+		return 0;
+
+	ms = ast_tvdiff_ms(ast_tvnow(), pvt->uac_diag_last_tx_enqueue);
+	if (ms < 0)
+		ms = 0;
+	return (unsigned int)ms;
+}
+
+static unsigned int uac_diag_ms_since_last_rx(struct pvt *pvt)
+{
+	int ms;
+
+	if (!pvt->uac_diag_rx_started)
+		return 0;
+
+	ms = ast_tvdiff_ms(ast_tvnow(), pvt->uac_diag_last_rx_enqueue);
+	if (ms < 0)
+		ms = 0;
+	return (unsigned int)ms;
+}
+
+static void uac_diag_note_tx_enqueue(struct pvt *pvt)
+{
+	unsigned int gap_ms = 0;
+
+	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0)
+		return;
+
+	pvt->uac_diag_tx_frame_in++;
+	if (pvt->uac_diag_tx_started) {
+		int ms = ast_tvdiff_ms(ast_tvnow(), pvt->uac_diag_last_tx_enqueue);
+		if (ms < 0)
+			ms = 0;
+		gap_ms = (unsigned int)ms;
+		if (gap_ms > pvt->uac_diag_tx_gap_max_ms)
+			pvt->uac_diag_tx_gap_max_ms = gap_ms;
+		if (gap_ms > UAC_DIAG_GAP_DETAIL_MS)
+			pvt->uac_diag_tx_gap_25ms++;
+		if (gap_ms > UAC_DIAG_GAP_EVENT_MS) {
+			pvt->uac_diag_tx_gap_60ms++;
+			if (uac_diag_is_post_answer(pvt))
+				pvt->uac_diag_tx_gap_60ms_post_answer++;
+			if (uac_diag_in_dtmf_window(pvt))
+				pvt->uac_diag_tx_gap_60ms_dtmf++;
+		}
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS)
+			pvt->uac_diag_tx_gap_250ms++;
+
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS) {
+			UAC_DIAG_EVENT(pvt, "TX enqueue gap=%u ms rb_frames=%u target=%u",
+				gap_ms, (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE),
+				pvt->uac_target_frames);
+		} else if (gap_ms > UAC_DIAG_GAP_EVENT_MS) {
+			UAC_DIAG_DETAIL(pvt, "TX enqueue gap=%u ms rb_frames=%u target=%u",
+				gap_ms, (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE),
+				pvt->uac_target_frames);
+		} else if (gap_ms > UAC_DIAG_GAP_DETAIL_MS) {
+			UAC_DIAG_TRACE(pvt, 1, "TX enqueue gap=%u ms rb_frames=%u target=%u",
+				gap_ms, (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE),
+				pvt->uac_target_frames);
+		}
+	} else {
+		pvt->uac_diag_tx_started = 1;
+	}
+
+	pvt->uac_diag_last_tx_enqueue = ast_tvnow();
+}
+
+static void uac_diag_note_rx_enqueue(struct pvt *pvt)
+{
+	unsigned int gap_ms = 0;
+
+	if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0)
+		return;
+
+	pvt->uac_diag_rx_frame_in++;
+	if (pvt->uac_diag_rx_started) {
+		int ms = ast_tvdiff_ms(ast_tvnow(), pvt->uac_diag_last_rx_enqueue);
+		if (ms < 0)
+			ms = 0;
+		gap_ms = (unsigned int)ms;
+		if (gap_ms > pvt->uac_diag_rx_gap_max_ms)
+			pvt->uac_diag_rx_gap_max_ms = gap_ms;
+		if (gap_ms > UAC_DIAG_GAP_DETAIL_MS)
+			pvt->uac_diag_rx_gap_25ms++;
+		if (gap_ms > UAC_DIAG_GAP_EVENT_MS) {
+			pvt->uac_diag_rx_gap_60ms++;
+			if (uac_diag_is_post_answer(pvt))
+				pvt->uac_diag_rx_gap_60ms_post_answer++;
+			if (uac_diag_in_dtmf_window(pvt))
+				pvt->uac_diag_rx_gap_60ms_dtmf++;
+		}
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS)
+			pvt->uac_diag_rx_gap_250ms++;
+
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS) {
+			UAC_DIAG_EVENT(pvt, "RX enqueue gap=%u ms rb_frames=%u target=%u",
+				gap_ms, (unsigned int)(rb_used(&pvt->uac_rx_rb) / FRAME_SIZE),
+				pvt->uac_target_frames);
+		} else if (gap_ms > UAC_DIAG_GAP_EVENT_MS) {
+			UAC_DIAG_DETAIL(pvt, "RX enqueue gap=%u ms rb_frames=%u target=%u",
+				gap_ms, (unsigned int)(rb_used(&pvt->uac_rx_rb) / FRAME_SIZE),
+				pvt->uac_target_frames);
+		} else if (gap_ms > UAC_DIAG_GAP_DETAIL_MS) {
+			UAC_DIAG_TRACE(pvt, 1, "RX enqueue gap=%u ms rb_frames=%u target=%u",
+				gap_ms, (unsigned int)(rb_used(&pvt->uac_rx_rb) / FRAME_SIZE),
+				pvt->uac_target_frames);
+		}
+	} else {
+		pvt->uac_diag_rx_started = 1;
+	}
+
+	pvt->uac_diag_last_rx_enqueue = ast_tvnow();
+}
+
+static void uac_diag_note_rx_delivery(struct pvt *pvt, int degraded, int kind, struct ast_frame *out)
+{
+	unsigned int gap_ms = 0;
+
+	if (!out || out->frametype != AST_FRAME_VOICE)
+		return;
+
+	pvt->uac_diag_rx_out_frame_out++;
+	if (pvt->uac_diag_rx_out_started) {
+		int ms = ast_tvdiff_ms(ast_tvnow(), pvt->uac_diag_last_rx_delivery);
+		if (ms < 0)
+			ms = 0;
+		gap_ms = (unsigned int)ms;
+		if (gap_ms > pvt->uac_diag_rx_out_gap_max_ms)
+			pvt->uac_diag_rx_out_gap_max_ms = gap_ms;
+		if (gap_ms > UAC_DIAG_GAP_DETAIL_MS)
+			pvt->uac_diag_rx_out_gap_25ms++;
+		if (gap_ms > UAC_DIAG_GAP_EVENT_MS) {
+			pvt->uac_diag_rx_out_gap_60ms++;
+			if (uac_diag_is_post_answer(pvt))
+				pvt->uac_diag_rx_out_gap_60ms_post_answer++;
+			if (uac_diag_in_dtmf_window(pvt))
+				pvt->uac_diag_rx_out_gap_60ms_dtmf++;
+		}
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS)
+			pvt->uac_diag_rx_out_gap_250ms++;
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS)
+			UAC_DIAG_EVENT(pvt, "RX delivery gap=%u ms kind=%d degraded=%d", gap_ms, kind, degraded);
+		else if (gap_ms > UAC_DIAG_GAP_EVENT_MS)
+			UAC_DIAG_DETAIL(pvt, "RX delivery gap=%u ms kind=%d degraded=%d", gap_ms, kind, degraded);
+		else if (gap_ms > UAC_DIAG_GAP_DETAIL_MS)
+			UAC_DIAG_TRACE(pvt, 1, "RX delivery gap=%u ms kind=%d degraded=%d", gap_ms, kind, degraded);
+	} else {
+		pvt->uac_diag_rx_out_started = 1;
+	}
+
+	pvt->uac_diag_last_rx_delivery = ast_tvnow();
+	if (degraded)
+		pvt->uac_diag_rx_out_degraded++;
+	if (kind == UAC_DIAG_RX_KIND_PLC)
+		pvt->uac_diag_rx_out_plc++;
+	else if (kind == UAC_DIAG_RX_KIND_SILENCE)
+		pvt->uac_diag_rx_out_silence++;
+}
+
+static void uac_diag_playback_note(struct pvt *pvt, const char *reason,
+		snd_pcm_state_t state, snd_pcm_sframes_t avail,
+		snd_pcm_uframes_t queued, snd_pcm_uframes_t want_fill,
+		snd_pcm_uframes_t left)
+{
+	unsigned int tx_rb_frames = (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE);
+	unsigned int seen;
+	unsigned int gap_ms = uac_diag_ms_since_last_tx(pvt);
+
+	pvt->uac_diag_playback_last_state = (unsigned int)state;
+	pvt->uac_diag_playback_last_avail = avail;
+	pvt->uac_diag_playback_last_queued = queued;
+	pvt->uac_diag_playback_last_want_fill = want_fill;
+	pvt->uac_diag_playback_last_tx_rb_frames = tx_rb_frames;
+	pvt->uac_diag_playback_last_left = left;
+	pvt->uac_diag_playback_last_gap_ms = gap_ms;
+
+	seen = pvt->uac_diag_playback_plc_ticks +
+		pvt->uac_diag_playback_silence_ticks +
+		pvt->uac_diag_playback_short_write_breaks;
+	if (uac_diag_in_dtmf_window(pvt)) {
+		pvt->uac_diag_playback_degraded_dtmf++;
+		if (reason && !strcmp(reason, "tx-plc"))
+			pvt->uac_diag_playback_plc_dtmf++;
+		else if (reason && !strcmp(reason, "tx-silence"))
+			pvt->uac_diag_playback_silence_dtmf++;
+	}
+
+	if (pvt->uac_diag_playback_degraded_logs < 12 || (seen % 100U) == 0U) {
+		if (gap_ms > UAC_DIAG_GAP_WARN_MS || (reason && !strcmp(reason, "short-write"))) {
+			UAC_DIAG_EVENT(pvt,
+				"playback degraded reason=%s state=%d avail=%ld queued=%lu want=%lu tx_rb_frames=%u have_last_tx=%u tx_plc_left=%u left=%lu target=%u gap=%u",
+				reason ? reason : "unknown", (int)state, (long)avail,
+				(unsigned long)queued, (unsigned long)want_fill, tx_rb_frames,
+				pvt->uac_have_last_tx ? 1U : 0U, pvt->uac_tx_plc_left,
+				(unsigned long)left, pvt->uac_target_frames, gap_ms);
+		} else {
+			UAC_DIAG_DETAIL(pvt,
+				"playback degraded reason=%s state=%d avail=%ld queued=%lu want=%lu tx_rb_frames=%u have_last_tx=%u tx_plc_left=%u left=%lu target=%u gap=%u",
+				reason ? reason : "unknown", (int)state, (long)avail,
+				(unsigned long)queued, (unsigned long)want_fill, tx_rb_frames,
+				pvt->uac_have_last_tx ? 1U : 0U, pvt->uac_tx_plc_left,
+				(unsigned long)left, pvt->uac_target_frames, gap_ms);
+		}
+		pvt->uac_diag_playback_degraded_logs++;
+	}
+}
+
 static void uac_diag_reset(struct pvt *pvt)
 {
 	pvt->uac_diag_dtmf_begin = 0;
@@ -835,6 +1201,71 @@ static void uac_diag_reset(struct pvt *pvt)
 	pvt->uac_diag_playback_write_recover = 0;
 	pvt->uac_diag_capture_degraded_ticks = 0;
 	pvt->uac_diag_playback_degraded_ticks = 0;
+	pvt->uac_diag_playback_plc_ticks = 0;
+	pvt->uac_diag_playback_silence_ticks = 0;
+	pvt->uac_diag_playback_short_write_breaks = 0;
+	pvt->uac_diag_playback_degraded_logs = 0;
+	pvt->uac_diag_tx_frame_in = 0;
+	pvt->uac_diag_tx_gap_25ms = 0;
+	pvt->uac_diag_tx_gap_60ms = 0;
+	pvt->uac_diag_tx_gap_250ms = 0;
+	pvt->uac_diag_tx_gap_60ms_post_answer = 0;
+	pvt->uac_diag_tx_gap_60ms_dtmf = 0;
+	pvt->uac_diag_tx_gap_max_ms = 0;
+	pvt->uac_diag_tx_rb_empty_after_tx = 0;
+	pvt->uac_diag_tx_rb_empty_gap_60ms = 0;
+	pvt->uac_diag_playback_degraded_after_tx = 0;
+	pvt->uac_diag_playback_plc_after_tx = 0;
+	pvt->uac_diag_playback_silence_after_tx = 0;
+	pvt->uac_diag_playback_degraded_dtmf = 0;
+	pvt->uac_diag_playback_plc_dtmf = 0;
+	pvt->uac_diag_playback_silence_dtmf = 0;
+	pvt->uac_diag_rx_frame_in = 0;
+	pvt->uac_diag_rx_gap_25ms = 0;
+	pvt->uac_diag_rx_gap_60ms = 0;
+	pvt->uac_diag_rx_gap_250ms = 0;
+	pvt->uac_diag_rx_gap_60ms_post_answer = 0;
+	pvt->uac_diag_rx_gap_60ms_dtmf = 0;
+	pvt->uac_diag_rx_gap_max_ms = 0;
+	pvt->uac_diag_rx_empty_after_rx = 0;
+	pvt->uac_diag_rx_empty_gap_60ms = 0;
+	pvt->uac_diag_rx_plc_ticks = 0;
+	pvt->uac_diag_rx_silence_ticks = 0;
+	pvt->uac_diag_rx_plc_post_answer = 0;
+	pvt->uac_diag_rx_silence_post_answer = 0;
+	pvt->uac_diag_rx_out_frame_out = 0;
+	pvt->uac_diag_rx_out_gap_25ms = 0;
+	pvt->uac_diag_rx_out_gap_60ms = 0;
+	pvt->uac_diag_rx_out_gap_250ms = 0;
+	pvt->uac_diag_rx_out_gap_60ms_post_answer = 0;
+	pvt->uac_diag_rx_out_gap_60ms_dtmf = 0;
+	pvt->uac_diag_rx_out_gap_max_ms = 0;
+	pvt->uac_diag_rx_out_degraded = 0;
+	pvt->uac_diag_rx_out_plc = 0;
+	pvt->uac_diag_rx_out_silence = 0;
+	pvt->uac_diag_playback_last_state = 0;
+	pvt->uac_diag_playback_last_avail = 0;
+	pvt->uac_diag_playback_last_queued = 0;
+	pvt->uac_diag_playback_last_want_fill = 0;
+	pvt->uac_diag_playback_last_tx_rb_frames = 0;
+	pvt->uac_diag_playback_last_left = 0;
+	pvt->uac_diag_playback_last_gap_ms = 0;
+	pvt->uac_diag_tx_started = 0;
+	pvt->uac_diag_rx_started = 0;
+	pvt->uac_diag_rx_out_started = 0;
+	pvt->uac_diag_answered = 0;
+	pvt->uac_diag_summary_logged = 0;
+	pvt->uac_diag_call_start = ast_tvnow();
+	pvt->uac_diag_answer_time.tv_sec = 0;
+	pvt->uac_diag_answer_time.tv_usec = 0;
+	pvt->uac_diag_last_dtmf_begin.tv_sec = 0;
+	pvt->uac_diag_last_dtmf_begin.tv_usec = 0;
+	pvt->uac_diag_last_tx_enqueue.tv_sec = 0;
+	pvt->uac_diag_last_tx_enqueue.tv_usec = 0;
+	pvt->uac_diag_last_rx_enqueue.tv_sec = 0;
+	pvt->uac_diag_last_rx_enqueue.tv_usec = 0;
+	pvt->uac_diag_last_rx_delivery.tv_sec = 0;
+	pvt->uac_diag_last_rx_delivery.tv_usec = 0;
 }
 
 static void uac_raise_target(struct pvt *pvt, const char *reason)
@@ -995,6 +1426,7 @@ static void uac_queue_tx_frame(struct pvt *pvt, const void *data, size_t len)
 
 	memset(frame, 0, sizeof(frame));
 	memcpy(frame, data, copy);
+	uac_diag_note_tx_enqueue(pvt);
 
 	if (pvt->uac_have_last_tx)
 		uac_sanitize_edge_from_prev(pvt->uac_last_tx_frame, frame, pvt->uac_tx_plc_left != 0);
@@ -1027,6 +1459,7 @@ static void uac_queue_rx_frame(struct pvt *pvt, void *data)
 			PVT_ID(pvt), (unsigned long)rb_used(&pvt->uac_rx_rb));
 	}
 	rb_write(&pvt->uac_rx_rb, data, FRAME_SIZE);
+	uac_diag_note_rx_enqueue(pvt);
 
 	memcpy(pvt->uac_last_rx_frame, frame, FRAME_SIZE);
 	pvt->uac_have_last_rx = 1;
@@ -1055,7 +1488,7 @@ static int uac_capture_drain(struct pvt *pvt)
 		state = snd_pcm_state(pvt->icard);
 		if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
 			pvt->uac_diag_capture_prepare++;
-			ast_verb(3, "[%s] UAC diag capture prepare state=%d\n", PVT_ID(pvt), state);
+			UAC_DIAG_EVENT(pvt, "capture prepare state=%d", state);
 			r = snd_pcm_prepare(pvt->icard);
 			if (r < 0) {
 				ast_log(LOG_ERROR, "Unable to prepare capture PCM: %s\n", snd_strerror(r));
@@ -1067,7 +1500,7 @@ static int uac_capture_drain(struct pvt *pvt)
 		}
 		if (state == SND_PCM_STATE_PREPARED) {
 			pvt->uac_diag_capture_start++;
-			ast_verb(3, "[%s] UAC diag capture start\n", PVT_ID(pvt));
+			UAC_DIAG_EVENT(pvt, "capture start");
 			r = snd_pcm_start(pvt->icard);
 			if (r < 0 && r != -EBUSY) {
 				ast_log(LOG_ERROR, "Unable to start capture PCM: %s\n", snd_strerror(r));
@@ -1083,7 +1516,7 @@ static int uac_capture_drain(struct pvt *pvt)
 		if (avail < 0) {
 			int rec;
 			pvt->uac_diag_capture_avail_recover++;
-			ast_verb(3, "[%s] UAC diag capture avail recover avail=%ld\n", PVT_ID(pvt), (long)avail);
+			UAC_DIAG_EVENT(pvt, "capture avail recover avail=%ld", (long)avail);
 			rec = snd_pcm_recover(pvt->icard, (int)avail, 1);
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
@@ -1106,7 +1539,7 @@ static int uac_capture_drain(struct pvt *pvt)
 		if (r < 0) {
 			int rec;
 			pvt->uac_diag_capture_read_recover++;
-			ast_verb(3, "[%s] UAC diag capture read recover read=%d\n", PVT_ID(pvt), r);
+			UAC_DIAG_EVENT(pvt, "capture read recover read=%d", r);
 			rec = snd_pcm_recover(pvt->icard, r, 1);
 			pvt->uac_readpos = 0;
 			pvt->uac_readleft = FRAME_SIZE2;
@@ -1148,7 +1581,7 @@ static int uac_playback_tick(struct pvt *pvt)
 	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
 		int r;
 		pvt->uac_diag_playback_prepare++;
-		ast_verb(3, "[%s] UAC diag playback prepare state=%d\n", PVT_ID(pvt), state);
+		UAC_DIAG_EVENT(pvt, "playback prepare state=%d", state);
 		r = snd_pcm_prepare(pvt->ocard);
 		if (r < 0) {
 			ast_log(LOG_ERROR, "Unable to prepare playback PCM: %s\n", snd_strerror(r));
@@ -1163,7 +1596,7 @@ static int uac_playback_tick(struct pvt *pvt)
 	if (avail < 0) {
 		int rec;
 		pvt->uac_diag_playback_avail_recover++;
-		ast_verb(3, "[%s] UAC diag playback avail recover avail=%ld\n", PVT_ID(pvt), (long)avail);
+		UAC_DIAG_EVENT(pvt, "playback avail recover avail=%ld", (long)avail);
 		rec = snd_pcm_recover(pvt->ocard, (int)avail, 1);
 		if (rec < 0)
 			ast_log(LOG_ERROR, "Playback avail recover failed: %s\n", snd_strerror(rec));
@@ -1174,6 +1607,12 @@ static int uac_playback_tick(struct pvt *pvt)
 	if (pvt->uac_playback_buffer && (snd_pcm_uframes_t)avail <= pvt->uac_playback_buffer)
 		queued = pvt->uac_playback_buffer - (snd_pcm_uframes_t)avail;
 	want_fill = uac_pcm_target_fill(pvt);
+	pvt->uac_diag_playback_last_state = (unsigned int)state;
+	pvt->uac_diag_playback_last_avail = avail;
+	pvt->uac_diag_playback_last_queued = queued;
+	pvt->uac_diag_playback_last_want_fill = want_fill;
+	pvt->uac_diag_playback_last_tx_rb_frames = (unsigned int)(rb_used(&pvt->uac_tx_rb) / FRAME_SIZE);
+	pvt->uac_diag_playback_last_left = 0;
 	max_loops = (unsigned int)(want_fill / FRAME_SIZE2);
 	if (max_loops < 1)
 		max_loops = 1;
@@ -1205,13 +1644,33 @@ static int uac_playback_tick(struct pvt *pvt)
 			pvt->uac_have_last_tx = 1;
 			pvt->uac_tx_plc_left = 2;
 		} else if (pvt->uac_have_last_tx && pvt->uac_tx_plc_left > 0) {
+			unsigned int gap_ms = uac_diag_ms_since_last_tx(pvt);
 			memcpy(frame, pvt->uac_last_tx_frame, FRAME_SIZE);
 			uac_fade_frame(frame, pvt->uac_tx_plc_left);
 			pvt->uac_tx_plc_left--;
+			pvt->uac_diag_playback_plc_ticks++;
+			if (pvt->uac_diag_tx_started) {
+				pvt->uac_diag_playback_degraded_after_tx++;
+				pvt->uac_diag_playback_plc_after_tx++;
+				pvt->uac_diag_tx_rb_empty_after_tx++;
+				if (gap_ms > 60U)
+					pvt->uac_diag_tx_rb_empty_gap_60ms++;
+			}
+			uac_diag_playback_note(pvt, "tx-plc", state, avail, queued, want_fill, 0);
 			uac_raise_target(pvt, "tx underrun");
 			degraded = 1;
 		} else {
+			unsigned int gap_ms = uac_diag_ms_since_last_tx(pvt);
 			memset(frame, 0, sizeof(frame));
+			pvt->uac_diag_playback_silence_ticks++;
+			if (pvt->uac_diag_tx_started) {
+				pvt->uac_diag_playback_degraded_after_tx++;
+				pvt->uac_diag_playback_silence_after_tx++;
+				pvt->uac_diag_tx_rb_empty_after_tx++;
+				if (gap_ms > 60U)
+					pvt->uac_diag_tx_rb_empty_gap_60ms++;
+			}
+			uac_diag_playback_note(pvt, "tx-silence", state, avail, queued, want_fill, 0);
 			uac_raise_target(pvt, "tx silence");
 			degraded = 1;
 		}
@@ -1225,20 +1684,26 @@ static int uac_playback_tick(struct pvt *pvt)
 			if (r < 0) {
 				int rec;
 				pvt->uac_diag_playback_write_recover++;
-				ast_verb(3, "[%s] UAC diag playback write recover write=%d\n", PVT_ID(pvt), r);
+				UAC_DIAG_EVENT(pvt, "playback write recover write=%d", r);
 				rec = snd_pcm_recover(pvt->ocard, r, 1);
 				if (rec < 0)
 					ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(rec));
 				uac_raise_target(pvt, "playback write");
 				return 1;
 			}
-			if (r == 0)
+			if (r == 0) {
+				pvt->uac_diag_playback_short_write_breaks++;
+				uac_diag_playback_note(pvt, "zero-write", state, avail, queued, want_fill, left);
 				break;
+			}
 			left -= (snd_pcm_uframes_t)r;
 			ptr += r * 2;
 		}
-		if (left > 0)
+		if (left > 0) {
+			pvt->uac_diag_playback_short_write_breaks++;
+			uac_diag_playback_note(pvt, "short-write", state, avail, queued, want_fill, left);
 			break;
+		}
 		queued += FRAME_SIZE2;
 	}
 
@@ -1247,13 +1712,14 @@ static int uac_playback_tick(struct pvt *pvt)
 
 
 
-static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, int *degraded)
+static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, int *degraded, int *diag_kind)
 {
 	char frame[FRAME_SIZE];
 	struct iovec iov[2];
 	int iovcnt;
 
 	*degraded = 0;
+	*diag_kind = UAC_DIAG_RX_KIND_NORMAL;
 	if (rb_used(&pvt->uac_rx_rb) >= FRAME_SIZE) {
 		iovcnt = rb_read_n_iov(&pvt->uac_rx_rb, iov, FRAME_SIZE);
 		if (iovcnt == 2) {
@@ -1277,16 +1743,40 @@ static struct ast_frame *uac_dequeue_frame(struct cpvt *cpvt, struct pvt *pvt, i
 			*degraded = 1;
 		}
 	} else if (pvt->uac_have_last_rx && pvt->uac_rx_plc_left > 0) {
+		unsigned int gap_ms = uac_diag_ms_since_last_rx(pvt);
 		memcpy(frame, pvt->uac_last_rx_frame, FRAME_SIZE);
 		uac_fade_frame(frame, pvt->uac_rx_plc_left);
 		pvt->uac_rx_plc_left--;
 		pvt->uac_rx_fadein_left = 2;
+		pvt->uac_diag_rx_plc_ticks++;
+		if (pvt->uac_diag_rx_started) {
+			pvt->uac_diag_rx_empty_after_rx++;
+			if (gap_ms > UAC_DIAG_GAP_EVENT_MS)
+				pvt->uac_diag_rx_empty_gap_60ms++;
+			if (uac_diag_is_post_answer(pvt))
+				pvt->uac_diag_rx_plc_post_answer++;
+		}
+		if (uac_diag_in_dtmf_window(pvt))
+			UAC_DIAG_DETAIL(pvt, "RX underrun plc gap=%u target=%u", gap_ms, pvt->uac_target_frames);
 		uac_raise_target(pvt, "rx underrun");
 		*degraded = 1;
+		*diag_kind = UAC_DIAG_RX_KIND_PLC;
 	} else {
+		unsigned int gap_ms = uac_diag_ms_since_last_rx(pvt);
 		pvt->uac_rx_fadein_left = 2;
+		pvt->uac_diag_rx_silence_ticks++;
+		if (pvt->uac_diag_rx_started) {
+			pvt->uac_diag_rx_empty_after_rx++;
+			if (gap_ms > UAC_DIAG_GAP_EVENT_MS)
+				pvt->uac_diag_rx_empty_gap_60ms++;
+			if (uac_diag_is_post_answer(pvt))
+				pvt->uac_diag_rx_silence_post_answer++;
+		}
+		if (uac_diag_in_dtmf_window(pvt))
+			UAC_DIAG_DETAIL(pvt, "RX silence gap=%u target=%u", gap_ms, pvt->uac_target_frames);
 		uac_raise_target(pvt, "rx silence");
 		*degraded = 1;
+		*diag_kind = UAC_DIAG_RX_KIND_SILENCE;
 		return uac_make_silence_frame(cpvt);
 	}
 
@@ -1475,6 +1965,7 @@ e_return:
 	{
 		struct ast_frame *out;
 		int degraded = 0;
+		int rx_diag_kind = UAC_DIAG_RX_KIND_NORMAL;
 
 		if (pvt->a_timer)
 			ast_timer_ack(pvt->a_timer, 1);
@@ -1489,7 +1980,7 @@ e_return:
 			degraded |= capture_degraded;
 			degraded |= playback_degraded;
 		}
-		out = uac_dequeue_frame(cpvt, pvt, &degraded);
+		out = uac_dequeue_frame(cpvt, pvt, &degraded, &rx_diag_kind);
 
 		if (pvt->dsp)
 		{
@@ -1554,6 +2045,8 @@ e_return:
 			if (ast_frame_adjust_volume(out, CONF_SHARED(pvt, rxgain)) == -1)
 				ast_debug(1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
 		}
+
+		uac_diag_note_rx_delivery(pvt, degraded, rx_diag_kind, out);
 
 		if (!degraded)
 			uac_note_stable_tick(pvt);
@@ -1961,11 +2454,13 @@ EXPORT_DEF void change_channel_state(struct cpvt * cpvt, unsigned newstate, int 
 					else if (cpvt->dir == CALL_DIR_OUTGOING)
 					{
 						ast_debug (1, "[%s] Remote end answered on call idx %d\n", PVT_ID(pvt), call_idx);
+						uac_diag_mark_answered(pvt, cpvt, "remote answer");
 						queue_control_channel (cpvt, AST_CONTROL_ANSWER);
 					}
 					else /* if (cpvt->answered) */
 					{
 						ast_debug (1, "[%s] Call idx %d answer\n", PVT_ID(pvt), call_idx);
+						uac_diag_mark_answered(pvt, cpvt, "channel up");
 						ast_setstate (channel, AST_STATE_UP);
 					}
 					break;
@@ -1979,7 +2474,7 @@ EXPORT_DEF void change_channel_state(struct cpvt * cpvt, unsigned newstate, int 
 				case CALL_STATE_RELEASED:
 					disactivate_call(cpvt);
 					/* from +CEND, restart or disconnect */
-
+					uac_diag_log_summary_once(pvt, cpvt, "released");
 
 					/* drop channel -> cpvt reference */
 					ast_channel_tech_pvt_set(channel, NULL);

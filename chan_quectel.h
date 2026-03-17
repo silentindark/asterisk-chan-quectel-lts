@@ -188,6 +188,66 @@ typedef struct pvt
 	unsigned int	uac_diag_playback_write_recover;	/*!< playback write recover attempts */
 	unsigned int	uac_diag_capture_degraded_ticks;	/*!< capture tick reported degraded */
 	unsigned int	uac_diag_playback_degraded_ticks;	/*!< playback tick reported degraded */
+	unsigned int	uac_diag_playback_plc_ticks;	/*!< playback tick used PLC frame because TX queue was empty */
+	unsigned int	uac_diag_playback_silence_ticks;	/*!< playback tick injected silence because TX queue was empty */
+	unsigned int	uac_diag_playback_short_write_breaks;	/*!< playback loop stopped with unwritten samples left */
+	unsigned int	uac_diag_playback_degraded_logs;	/*!< playback degraded detail logs already emitted */
+	unsigned int	uac_diag_tx_frame_in;		/*!< TX voice frames queued into UAC */
+	unsigned int	uac_diag_tx_gap_25ms;		/*!< gap >25ms between queued TX voice frames */
+	unsigned int	uac_diag_tx_gap_60ms;		/*!< gap >60ms between queued TX voice frames */
+	unsigned int	uac_diag_tx_gap_250ms;		/*!< gap >250ms between queued TX voice frames */
+	unsigned int	uac_diag_tx_gap_60ms_post_answer;	/*!< TX gaps >60ms after answer */
+	unsigned int	uac_diag_tx_gap_60ms_dtmf;	/*!< TX gaps >60ms during DTMF window */
+	unsigned int	uac_diag_tx_gap_max_ms;		/*!< maximum observed gap between queued TX voice frames */
+	unsigned int	uac_diag_tx_rb_empty_after_tx;	/*!< playback found TX rb empty after TX had already started */
+	unsigned int	uac_diag_tx_rb_empty_gap_60ms;	/*!< TX rb empty after TX start with last gap >60ms */
+	unsigned int	uac_diag_playback_degraded_after_tx;	/*!< degraded playback ticks after first TX frame was seen */
+	unsigned int	uac_diag_playback_plc_after_tx;	/*!< PLC playback ticks after first TX frame was seen */
+	unsigned int	uac_diag_playback_silence_after_tx;	/*!< silence playback ticks after first TX frame was seen */
+	unsigned int	uac_diag_playback_degraded_dtmf;	/*!< degraded playback ticks during DTMF window */
+	unsigned int	uac_diag_playback_plc_dtmf;	/*!< PLC playback ticks during DTMF window */
+	unsigned int	uac_diag_playback_silence_dtmf;	/*!< silence playback ticks during DTMF window */
+	unsigned int	uac_diag_rx_frame_in;		/*!< RX voice frames queued from UAC capture */
+	unsigned int	uac_diag_rx_gap_25ms;		/*!< gap >25ms between queued RX voice frames */
+	unsigned int	uac_diag_rx_gap_60ms;		/*!< gap >60ms between queued RX voice frames */
+	unsigned int	uac_diag_rx_gap_250ms;		/*!< gap >250ms between queued RX voice frames */
+	unsigned int	uac_diag_rx_gap_60ms_post_answer;	/*!< RX gaps >60ms after answer */
+	unsigned int	uac_diag_rx_gap_60ms_dtmf;	/*!< RX gaps >60ms during DTMF window */
+	unsigned int	uac_diag_rx_gap_max_ms;		/*!< maximum observed gap between queued RX voice frames */
+	unsigned int	uac_diag_rx_empty_after_rx;	/*!< dequeue found RX rb empty after RX had started */
+	unsigned int	uac_diag_rx_empty_gap_60ms;	/*!< RX rb empty after RX start with last gap >60ms */
+	unsigned int	uac_diag_rx_plc_ticks;		/*!< RX dequeue used PLC frame */
+	unsigned int	uac_diag_rx_silence_ticks;		/*!< RX dequeue injected silence */
+	unsigned int	uac_diag_rx_plc_post_answer;	/*!< RX PLC after answer */
+	unsigned int	uac_diag_rx_silence_post_answer;	/*!< RX silence after answer */
+	unsigned int	uac_diag_rx_out_frame_out;	/*!< RX voice frames delivered out of channel_read() */
+	unsigned int	uac_diag_rx_out_gap_25ms;	/*!< gap >25ms between delivered RX voice frames */
+	unsigned int	uac_diag_rx_out_gap_60ms;	/*!< gap >60ms between delivered RX voice frames */
+	unsigned int	uac_diag_rx_out_gap_250ms;	/*!< gap >250ms between delivered RX voice frames */
+	unsigned int	uac_diag_rx_out_gap_60ms_post_answer;	/*!< delivered RX gaps >60ms after answer */
+	unsigned int	uac_diag_rx_out_gap_60ms_dtmf;	/*!< delivered RX gaps >60ms during DTMF window */
+	unsigned int	uac_diag_rx_out_gap_max_ms;	/*!< maximum observed gap between delivered RX voice frames */
+	unsigned int	uac_diag_rx_out_degraded;	/*!< delivered RX voice frames marked degraded */
+	unsigned int	uac_diag_rx_out_plc;	/*!< delivered RX voice frames that came from PLC */
+	unsigned int	uac_diag_rx_out_silence;	/*!< delivered RX voice frames that were injected silence */
+	unsigned int	uac_diag_playback_last_state;	/*!< last observed ALSA playback state when degraded */
+	snd_pcm_sframes_t	uac_diag_playback_last_avail;	/*!< last observed ALSA playback avail when degraded */
+	snd_pcm_uframes_t	uac_diag_playback_last_queued;	/*!< last observed queued playback frames when degraded */
+	snd_pcm_uframes_t	uac_diag_playback_last_want_fill;	/*!< last observed playback target fill when degraded */
+	unsigned int	uac_diag_playback_last_tx_rb_frames;	/*!< last observed queued TX frames when degraded */
+	snd_pcm_uframes_t	uac_diag_playback_last_left;	/*!< last unwritten playback frames when degraded */
+	unsigned int	uac_diag_playback_last_gap_ms;	/*!< ms since last queued TX frame when degraded */
+	unsigned int	uac_diag_tx_started;		/*!< first queued TX frame has been seen in this call */
+	unsigned int	uac_diag_rx_started;		/*!< first queued RX frame has been seen in this call */
+	unsigned int	uac_diag_rx_out_started;		/*!< first delivered RX frame has been seen in this call */
+	unsigned int	uac_diag_answered;		/*!< answer marker for current UAC call */
+	unsigned int	uac_diag_summary_logged;		/*!< summary already emitted for current UAC call */
+	struct timeval	uac_diag_call_start;		/*!< timestamp when current UAC runtime started */
+	struct timeval	uac_diag_answer_time;	/*!< timestamp when call was marked answered */
+	struct timeval	uac_diag_last_dtmf_begin;	/*!< timestamp of last DTMF begin */
+	struct timeval	uac_diag_last_tx_enqueue;	/*!< timestamp of last queued TX frame */
+	struct timeval	uac_diag_last_rx_enqueue;	/*!< timestamp of last queued RX frame */
+	struct timeval	uac_diag_last_rx_delivery;	/*!< timestamp of last delivered RX voice frame */
 	snd_pcm_uframes_t	uac_capture_period;		/*!< negotiated UAC capture period size */
 	snd_pcm_uframes_t	uac_capture_buffer;		/*!< negotiated UAC capture buffer size */
 	snd_pcm_uframes_t	uac_playback_period;		/*!< negotiated UAC playback period size */
