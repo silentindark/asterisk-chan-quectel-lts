@@ -688,13 +688,24 @@ EXPORT_DEF int at_enqueue_ping(struct cpvt *cpvt)
  * \param input -- user's command
  * \return 0 on success
  */
-EXPORT_DEF int at_enqueue_user_cmd(struct cpvt *cpvt, const char *input)
+EXPORT_DEF int at_enqueue_user_cmd_uid(struct cpvt *cpvt, const char *input, int uid)
 {
-	if (at_enqueue_generic(cpvt, CMD_USER, 1, "%s\r", input) != 0) {
+	int rv;
+	at_queue_cmd_t at_cmd = ATQ_CMD_DECLARE_DYN(CMD_USER);
+
+	rv = at_fill_generic_cmd(&at_cmd, "%s\r", input);
+	if (!rv)
+		rv = at_queue_insert_uid(cpvt, &at_cmd, 1, 1, uid);
+	if (rv != 0) {
 		chan_quectel_err = E_QUEUE;
 		return -1;
 	}
 	return 0;
+}
+
+EXPORT_DEF int at_enqueue_user_cmd(struct cpvt *cpvt, const char *input)
+{
+	return at_enqueue_user_cmd_uid(cpvt, input, 0);
 }
 
 /*!

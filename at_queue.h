@@ -82,6 +82,12 @@ typedef struct at_queue_task
 
 	int uid;
 
+	char *		user_cmd_response;	/*!< accumulated multi-line response body for CMD_USER */
+	size_t		user_cmd_response_len;	/*!< current CMD_USER response body length */
+	size_t		user_cmd_response_cap;	/*!< allocated CMD_USER response body buffer size */
+	char		user_cmd_final_response[64];	/*!< final terminal response line for CMD_USER, e.g. OK/ERROR */
+	unsigned	user_cmd_response_truncated : 1;	/*!< CMD_USER response exceeded buffer limit */
+
 	at_queue_cmd_t	cmds[0];	/* this field must be last */
 } at_queue_task_t;
 

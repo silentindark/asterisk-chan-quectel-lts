@@ -16,6 +16,7 @@ EXPORT_DECL int send_sms(const char *dev_name, const char *number, const char *m
 EXPORT_DECL int send_reset(const char *dev_name);
 EXPORT_DECL int send_ccwa_set(const char *dev_name, call_waiting_t enable);
 EXPORT_DECL int send_at_command(const char *dev_name, const char *command);
+EXPORT_DECL int send_at_command_sync(const char *dev_name, const char *command, unsigned timeout_ms, char **response, int *truncated, int *timed_out);
 EXPORT_DECL int schedule_restart_event(dev_state_t event, restate_time_t when, const char *dev_name);
 EXPORT_DECL int is_valid_phone_number(const char * number);
 

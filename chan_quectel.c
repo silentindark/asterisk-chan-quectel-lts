@@ -768,8 +768,20 @@ static void* do_monitor_phone (void* data)
 		PVT_STAT(pvt, d_read_bytes) += iovcnt;
 		ast_mutex_unlock (&pvt->lock);
 
-		while ((iovcnt = at_read_result_iov (dev, &read_result, &rb, iov)) > 0)
+		while (1)
 		{
+			int keep_plain_lines;
+
+			ast_mutex_lock (&pvt->lock);
+			keep_plain_lines = (at_queue_head_cmd(pvt) && at_queue_head_cmd(pvt)->cmd == CMD_USER);
+			ast_mutex_unlock (&pvt->lock);
+
+			iovcnt = at_read_result_iov (dev, &read_result, &rb, iov, keep_plain_lines);
+			if (iovcnt <= 0)
+			{
+				break;
+			}
+
 			at_res = at_read_result_classification (&rb, iov[0].iov_len + iov[1].iov_len);
 
 			ast_mutex_lock (&pvt->lock);
@@ -966,6 +978,8 @@ static void pvt_free(struct pvt * pvt)
 	at_queue_flush(pvt);
 	if(pvt->dsp)
 		ast_dsp_free(pvt->dsp);
+	if (pvt->user_cmd_sync_response)
+		ast_free(pvt->user_cmd_sync_response);
 
 	ast_mutex_unlock(&pvt->lock);
 

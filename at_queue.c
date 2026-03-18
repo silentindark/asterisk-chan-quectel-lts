@@ -11,7 +11,7 @@
 */
 #include "ast_config.h"
 
-#include <asterisk/utils.h>		/* ast_free() */
+#include <asterisk/utils.h>		/* ast_free() ast_realloc() */
 
 #include "at_queue.h"
 #include "chan_quectel.h"		/* struct pvt */
@@ -46,6 +46,10 @@ static void at_queue_free (at_queue_task_t * task)
 	for(no = 0; no < task->cmdsno; no++)
 	{
 		at_queue_free_data(&task->cmds[no]);
+	}
+	if (task->user_cmd_response)
+	{
+		ast_free(task->user_cmd_response);
 	}
 	ast_free (task);
 }
@@ -106,6 +110,12 @@ static at_queue_task_t * at_queue_add (struct cpvt * cpvt, const at_queue_cmd_t 
 			e->cmdsno = cmdsno;
 			e->cindex = 0;
 			e->cpvt = cpvt;
+			e->uid = 0;
+			e->user_cmd_response = NULL;
+			e->user_cmd_response_len = 0;
+			e->user_cmd_response_cap = 0;
+			e->user_cmd_final_response[0] = '\0';
+			e->user_cmd_response_truncated = 0;
 
 			memcpy(&e->cmds[0], cmds, cmdsno * sizeof(*cmds));
 
@@ -293,9 +303,12 @@ EXPORT_DEF int at_queue_insert_uid(struct cpvt * cpvt, at_queue_cmd_t * cmds, un
 {
 	unsigned idx;
 	at_queue_task_t *task = at_queue_add(cpvt, cmds, cmdsno, athead);
-	task->uid = uid;
 
-	if(!task)
+	if(task)
+	{
+		task->uid = uid;
+	}
+	else
 	{
 		for(idx = 0; idx < cmdsno; idx++)
 		{
@@ -303,7 +316,7 @@ EXPORT_DEF int at_queue_insert_uid(struct cpvt * cpvt, at_queue_cmd_t * cmds, un
 		}
 	}
 
-	if (at_queue_run(cpvt->pvt))
+	if (task && at_queue_run(cpvt->pvt))
 		task = NULL;
 
 	return task == NULL;

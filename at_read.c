@@ -102,7 +102,7 @@ EXPORT_DEF ssize_t at_read (int fd, const char * dev, struct ringbuffer* rb)
 	return n;
 }
 
-EXPORT_DEF int at_read_result_iov (const char * dev, int * read_result, struct ringbuffer* rb, struct iovec iov[2])
+EXPORT_DEF int at_read_result_iov (const char * dev, int * read_result, struct ringbuffer* rb, struct iovec iov[2], int keep_plain_lines)
 {
 	int	iovcnt = 0;
 	int	res;
@@ -122,7 +122,7 @@ EXPORT_DEF int at_read_result_iov (const char * dev, int * read_result, struct r
 				rb_read_upd (rb, 2);
 				*read_result = 1;
 
-				return at_read_result_iov (dev, read_result, rb, iov);
+				return at_read_result_iov (dev, read_result, rb, iov, keep_plain_lines);
 			}
 			else if (res > 0)
 			{
@@ -131,7 +131,13 @@ EXPORT_DEF int at_read_result_iov (const char * dev, int * read_result, struct r
 					ast_debug (5, "[%s] multiline response\n", dev);
 					rb_read_upd (rb, 1);
 
-					return at_read_result_iov (dev, read_result, rb, iov);
+					return at_read_result_iov (dev, read_result, rb, iov, keep_plain_lines);
+				}
+
+				if (keep_plain_lines && rb_read_until_char_iov (rb, iov, '\r') > 0)
+				{
+					*read_result = 1;
+					return 1 + (iov[1].iov_len > 0);
 				}
 
 				if (rb_read_until_char_iov (rb, iov, '\r') > 0)
@@ -141,7 +147,7 @@ EXPORT_DEF int at_read_result_iov (const char * dev, int * read_result, struct r
 
 				rb_read_upd (rb, s);
 
-				return at_read_result_iov (dev, read_result, rb, iov);
+				return at_read_result_iov (dev, read_result, rb, iov, keep_plain_lines);
 			}
 
 			return 0;
@@ -161,7 +167,7 @@ EXPORT_DEF int at_read_result_iov (const char * dev, int * read_result, struct r
 			else if (rb_memcmp (rb, "\r\n+CSSU:", 8) == 0 || rb_memcmp (rb, "\r\n+CMS ERROR:", 13) == 0 ||  rb_memcmp (rb, "\r\n+CMGS:", 8) == 0)
 			{
 				rb_read_upd (rb, 2);
-				return at_read_result_iov (dev, read_result, rb, iov);
+				return at_read_result_iov (dev, read_result, rb, iov, keep_plain_lines);
 			}
 			else if (rb_memcmp (rb, "> ", 2) == 0)
 			{

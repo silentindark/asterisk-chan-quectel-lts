@@ -11,6 +11,7 @@
 #include "ast_config.h"
 
 #include <asterisk.h>
+#include <stdlib.h>			/* strtoul */
 #include <asterisk/cli.h>			/* struct ast_cli_entry; struct ast_cli_args */
 #include <asterisk/callerid.h>			/* ast_describe_caller_presentation() */
 
@@ -399,7 +400,9 @@ static char* cli_cmd (struct ast_cli_entry* e, int cmd, struct ast_cli_args* a)
 			e->command =	"quectel cmd";
 			e->usage   =	"Usage: quectel cmd <device> <command>\n"
 					"       Send <command> to the rfcomm port on the device\n"
-					"       with the specified <device>.\n";
+					"       with the specified <device>.\n"
+					"       Deprecated alias for:\n"
+					"         quectel at <device> <command> async\n";
 			return NULL;
 
 		case CLI_GENERATE:
@@ -418,6 +421,83 @@ static char* cli_cmd (struct ast_cli_entry* e, int cmd, struct ast_cli_args* a)
 	int res = send_at_command(a->argv[2], a->argv[3]);
 	ast_cli (a->fd, "[%s] '%s' %s\n", a->argv[2], a->argv[3], res < 0 ? error2str(chan_quectel_err) : "AT command queued");
 
+	return CLI_SUCCESS;
+}
+
+static char* cli_at (struct ast_cli_entry* e, int cmd, struct ast_cli_args* a)
+{
+	unsigned timeout_ms = 5000;
+	char *response = NULL;
+	int truncated = 0;
+	int timed_out = 0;
+	int async_mode = 0;
+	int res;
+
+	switch (cmd)
+	{
+		case CLI_INIT:
+			e->command =	"quectel at";
+			e->usage   =	"Usage: quectel at <device> <command> [timeout_ms|async]\n"
+					"       Send <command> to the rfcomm port on the device\n"
+					"       with the specified <device>.\n"
+					"       Use 'async' to emulate the legacy 'quectel cmd' behavior.\n";
+			return NULL;
+
+		case CLI_GENERATE:
+			if (a->pos == 2)
+			{
+				return complete_device (a->word, a->n);
+			}
+			return NULL;
+	}
+
+	if (a->argc != 4 && a->argc != 5)
+	{
+		return CLI_SHOWUSAGE;
+	}
+	if (a->argc == 5)
+	{
+		if (!strcasecmp(a->argv[4], "async"))
+		{
+			async_mode = 1;
+		}
+		else
+		{
+			char *end = NULL;
+			unsigned long val = strtoul(a->argv[4], &end, 10);
+			if (!end || *end != '\0' || val == 0 || val > 60000UL)
+			{
+				ast_cli(a->fd, "Invalid timeout_ms '%s' (allowed range: 1..60000) or mode '%s'\n", a->argv[4], a->argv[4]);
+				return CLI_SHOWUSAGE;
+			}
+			timeout_ms = (unsigned) val;
+		}
+	}
+
+	if (async_mode)
+	{
+		res = send_at_command(a->argv[2], a->argv[3]);
+		ast_cli(a->fd, "[%s] '%s' %s\n", a->argv[2], a->argv[3], res < 0 ? error2str(chan_quectel_err) : "AT command queued");
+		return CLI_SUCCESS;
+	}
+
+	res = send_at_command_sync(a->argv[2], a->argv[3], timeout_ms, &response, &truncated, &timed_out);
+	if (res == -2 || timed_out)
+	{
+		ast_cli(a->fd, "[%s] '%s' timeout waiting for response\n", a->argv[2], a->argv[3]);
+		ast_free(response);
+		return CLI_SUCCESS;
+	}
+	if (res < 0)
+	{
+		ast_cli(a->fd, "[%s] '%s' %s\n", a->argv[2], a->argv[3], error2str(chan_quectel_err));
+		ast_free(response);
+		return CLI_SUCCESS;
+	}
+
+	ast_cli(a->fd, "[%s] Response for AT command:\n%s%s\n",
+		a->argv[2], response ? response : "", truncated ? "\n[truncated]" : "");
+	ast_free(response);
 	return CLI_SUCCESS;
 }
 
@@ -859,7 +939,8 @@ static struct ast_cli_entry cli[] = {
 	AST_CLI_DEFINE (cli_show_device_state,	 "Show Quectel device state"),
 	AST_CLI_DEFINE (cli_show_device_statistics,"Show Quectel device statistics"),
 	AST_CLI_DEFINE (cli_show_version,	"Show module version"),
-	AST_CLI_DEFINE (cli_cmd,		"Send commands to port for debugging"),
+	AST_CLI_DEFINE (cli_cmd,		"[Deprecated] Send commands to port for debugging"),
+	AST_CLI_DEFINE (cli_at,		"Send commands to port for debugging (sync)"),
 	AST_CLI_DEFINE (cli_ussd,		"Send USSD commands to the quectel"),
 	AST_CLI_DEFINE (cli_sms,		"Send SMS from the quectel"),
 	AST_CLI_DEFINE (cli_ccwa_set,		"Enable/Disable Call-Waiting on the quectel"),

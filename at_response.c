@@ -27,6 +27,7 @@
 #include "channel.h"				/* channel_queue_hangup() channel_queue_control() */
 #include "smsdb.h"
 #include "error.h"
+#include <asterisk/utils.h>		/* ast_realloc() */
 
 #define CCWA_STATUS_NOT_ACTIVE	0
 #define CCWA_STATUS_ACTIVE	1
@@ -116,6 +117,229 @@ static int at_response_rcend (struct pvt * pvt, const char* str)
 
 
 	return 0;
+}
+
+#define USER_CMD_RESPONSE_INITIAL_CAP 256U
+#define USER_CMD_RESPONSE_MAX 16384U
+
+static int user_cmd_response_append(at_queue_task_t *task, const char *line, int is_terminal)
+{
+	const char *start;
+	const char *end;
+	size_t line_len, needed, copy_len;
+	char *tmp;
+	size_t new_cap;
+
+	if (!task || !line)
+	{
+		return 0;
+	}
+
+	start = line;
+	while (*start == '\r' || *start == '\n')
+	{
+		start++;
+	}
+	end = start + strlen(start);
+	while (end > start && (end[-1] == '\r' || end[-1] == '\n'))
+	{
+		end--;
+	}
+	line_len = (size_t)(end - start);
+	if (line_len == 0)
+	{
+		return 0;
+	}
+
+	if (is_terminal)
+	{
+		copy_len = line_len;
+		if (copy_len >= sizeof(task->user_cmd_final_response))
+		{
+			copy_len = sizeof(task->user_cmd_final_response) - 1;
+			task->user_cmd_response_truncated = 1;
+		}
+		memcpy(task->user_cmd_final_response, start, copy_len);
+		task->user_cmd_final_response[copy_len] = '\0';
+		return (copy_len == line_len) ? 0 : -1;
+	}
+
+	needed = task->user_cmd_response_len + (task->user_cmd_response_len ? 1 : 0) + line_len + 1;
+	if (needed > task->user_cmd_response_cap)
+	{
+		new_cap = task->user_cmd_response_cap ? task->user_cmd_response_cap : USER_CMD_RESPONSE_INITIAL_CAP;
+		while (new_cap < needed && new_cap < USER_CMD_RESPONSE_MAX)
+		{
+			new_cap <<= 1;
+		}
+		if (new_cap > USER_CMD_RESPONSE_MAX)
+		{
+			new_cap = USER_CMD_RESPONSE_MAX;
+		}
+		if (new_cap <= task->user_cmd_response_cap)
+		{
+			task->user_cmd_response_truncated = 1;
+			return -1;
+		}
+		tmp = ast_realloc(task->user_cmd_response, new_cap);
+		if (!tmp)
+		{
+			task->user_cmd_response_truncated = 1;
+			return -1;
+		}
+		task->user_cmd_response = tmp;
+		task->user_cmd_response_cap = new_cap;
+	}
+
+	if (task->user_cmd_response_len && task->user_cmd_response_len < task->user_cmd_response_cap - 1)
+	{
+		task->user_cmd_response[task->user_cmd_response_len++] = '\n';
+	}
+
+	copy_len = line_len;
+	if (copy_len > task->user_cmd_response_cap - task->user_cmd_response_len - 1)
+	{
+		copy_len = task->user_cmd_response_cap - task->user_cmd_response_len - 1;
+		task->user_cmd_response_truncated = 1;
+	}
+
+	memcpy(task->user_cmd_response + task->user_cmd_response_len, start, copy_len);
+	task->user_cmd_response_len += copy_len;
+	task->user_cmd_response[task->user_cmd_response_len] = '\0';
+
+	return (copy_len == line_len) ? 0 : -1;
+}
+
+static char *user_cmd_response_render(const at_queue_task_t *task)
+{
+	const char *body;
+	const char *final_line;
+	char *rendered = NULL;
+
+	if (!task)
+	{
+		return ast_strdup("");
+	}
+
+	body = task->user_cmd_response ? task->user_cmd_response : "";
+	final_line = task->user_cmd_final_response[0] ? task->user_cmd_final_response : "";
+
+	if (body[0] != '\0' && final_line[0] != '\0')
+	{
+		if (task->user_cmd_response_truncated)
+		{
+			if (ast_asprintf(&rendered, "%s\n[truncated]\n\n%s", body, final_line) < 0)
+				rendered = NULL;
+		}
+		else
+		{
+			if (ast_asprintf(&rendered, "%s\n\n%s", body, final_line) < 0)
+				rendered = NULL;
+		}
+	}
+	else if (body[0] != '\0')
+	{
+		if (task->user_cmd_response_truncated)
+		{
+			if (ast_asprintf(&rendered, "%s\n[truncated]", body) < 0)
+				rendered = NULL;
+		}
+		else
+		{
+			rendered = ast_strdup(body);
+		}
+	}
+	else if (final_line[0] != '\0')
+	{
+		if (task->user_cmd_response_truncated)
+		{
+			if (ast_asprintf(&rendered, "[truncated]\n%s", final_line) < 0)
+				rendered = NULL;
+		}
+		else
+		{
+			rendered = ast_strdup(final_line);
+		}
+	}
+	else if (task->user_cmd_response_truncated)
+	{
+		rendered = ast_strdup("[truncated]");
+	}
+	else
+	{
+		rendered = ast_strdup("");
+	}
+
+	if (!rendered)
+	{
+		rendered = ast_strdup("");
+	}
+
+	return rendered;
+}
+
+static int user_cmd_sync_is_claimed(const struct pvt *pvt, const at_queue_task_t *task)
+{
+	unsigned int seq;
+
+	if (!pvt || !task || task->uid <= 0)
+	{
+		return 0;
+	}
+
+	seq = (unsigned int) task->uid;
+	return pvt->user_cmd_sync_pending_seq == seq || pvt->user_cmd_sync_done_seq == seq;
+}
+
+static void user_cmd_sync_complete(struct pvt *pvt, const at_queue_task_t *task)
+{
+	char *copy;
+
+	if (!pvt || !task || task->uid <= 0)
+	{
+		return;
+	}
+	if (pvt->user_cmd_sync_pending_seq != (unsigned int) task->uid)
+	{
+		return;
+	}
+
+	copy = user_cmd_response_render(task);
+	if (pvt->user_cmd_sync_response)
+	{
+		ast_free(pvt->user_cmd_sync_response);
+	}
+	pvt->user_cmd_sync_response = copy;
+	pvt->user_cmd_sync_response_truncated = task->user_cmd_response_truncated ? 1 : 0;
+	pvt->user_cmd_sync_done_seq = (unsigned int) task->uid;
+	pvt->user_cmd_sync_pending_seq = 0;
+}
+
+static void user_cmd_response_emit(struct pvt *pvt, const at_queue_task_t *task)
+{
+	char *body;
+
+	if (!task)
+	{
+		return;
+	}
+	if (user_cmd_sync_is_claimed(pvt, task))
+	{
+		return;
+	}
+
+	body = user_cmd_response_render(task);
+	if (!body || body[0] == '\0')
+	{
+		if (body)
+		{
+			ast_free(body);
+		}
+		return;
+	}
+
+	ast_verb(1, "[%s] Response for user's command:\n%s\n", PVT_ID(pvt), body);
+	ast_free(body);
 }
 
 static int at_response_cend (struct pvt * pvt, const char* str)
@@ -392,6 +616,8 @@ static int at_response_ok (struct pvt* pvt, at_res_t res)
 				}
 				break;
 			case CMD_USER:
+				user_cmd_sync_complete(pvt, task);
+				user_cmd_response_emit(pvt, task);
 				break;
 			default:
 				ast_log (LOG_ERROR, "[%s] Received 'OK' for unhandled command '%s'\n", PVT_ID(pvt), at_cmd2str (ecmd->cmd));
@@ -444,6 +670,14 @@ static int at_response_error (struct pvt* pvt, at_res_t res)
 
 	if (ecmd && (ecmd->res == RES_OK || ecmd->res == RES_CMGR || ecmd->res == RES_SMS_PROMPT))
 	{
+		if (ecmd->cmd == CMD_USER)
+		{
+			user_cmd_sync_complete(pvt, task);
+			user_cmd_response_emit(pvt, task);
+			at_queue_handle_result(pvt, res);
+			return 0;
+		}
+
 		switch (ecmd->cmd)
 		{
 			/* critical errors */
@@ -1556,8 +1790,11 @@ static int at_response_cmgr (struct pvt* pvt, const char * str, size_t len)
 	const struct at_queue_cmd * ecmd = at_queue_head_cmd(pvt);
 
 	manager_event_message("QuectelNewCMGR", PVT_ID(pvt), str);
+	if (ecmd && ecmd->cmd == CMD_USER) {
+		return 0;
+	}
 	if (ecmd) {
-		if (ecmd->res == RES_CMGR || ecmd->cmd == CMD_USER) {
+		if (ecmd->res == RES_CMGR) {
 			at_queue_handle_result (pvt, RES_CMGR);
 
 			res = at_parse_cmgr(str, len, &tpdu_type, sca, sizeof(sca), oa, sizeof(oa), scts, &mr, &st, dt, msg, &msg_len, &udh);
@@ -2068,7 +2305,7 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
 
 	if(iov[0].iov_len + iov[1].iov_len > 0)
 	{
-		len = iov[0].iov_len + iov[1].iov_len - 1;
+		len = iov[0].iov_len + iov[1].iov_len;
 
 		if (iovcnt == 2)
 		{
@@ -2083,12 +2320,18 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
 			str = iov[0].iov_base;
 		}
 		str[len] = '\0';
+		while (len > 0 && (str[len - 1] == '\r' || str[len - 1] == '\n'))
+		{
+			str[--len] = '\0';
+		}
 
 // 		ast_debug (5, "[%s] [%.*s]\n", PVT_ID(pvt), (int) len, str);
 
-		if(ecmd && ecmd->cmd == CMD_USER) {
-			ast_verb(1, "[%s] Got Response for user's command:'%s'\n", PVT_ID(pvt), str);
-			ast_log(LOG_NOTICE, "[%s] Got Response for user's command:'%s'\n", PVT_ID(pvt), str);
+		if (ecmd && ecmd->cmd == CMD_USER)
+		{
+			user_cmd_response_append((at_queue_task_t *)task, str,
+			(at_res == RES_OK || at_res == RES_ERROR || at_res == RES_CMS_ERROR ||
+			 at_res == RES_BUSY || at_res == RES_NO_CARRIER || at_res == RES_NO_DIALTONE));
 		}
 		switch (at_res)
 		{
@@ -2201,14 +2444,36 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
 				return at_response_ccwa (pvt, str);
 
 			case RES_BUSY:
+				if (ecmd && ecmd->cmd == CMD_USER)
+				{
+					user_cmd_sync_complete(pvt, task);
+					user_cmd_response_emit(pvt, task);
+					at_queue_handle_result(pvt, at_res);
+					return 0;
+				}
 				ast_log (LOG_ERROR, "[%s] Receive BUSY\n", PVT_ID(pvt));
+				at_response_busy(pvt, AST_CONTROL_BUSY);
 				return 0;
 
 			case RES_NO_DIALTONE:
+				if (ecmd && ecmd->cmd == CMD_USER)
+				{
+					user_cmd_sync_complete(pvt, task);
+					user_cmd_response_emit(pvt, task);
+					at_queue_handle_result(pvt, at_res);
+					return 0;
+				}
 				ast_log (LOG_ERROR, "[%s] Receive NO DIALTONE\n", PVT_ID(pvt));
 				at_response_busy(pvt, AST_CONTROL_CONGESTION);
 				break;
 			case RES_NO_CARRIER:
+				if (ecmd && ecmd->cmd == CMD_USER)
+				{
+					user_cmd_sync_complete(pvt, task);
+					user_cmd_response_emit(pvt, task);
+					at_queue_handle_result(pvt, at_res);
+					return 0;
+				}
 				ast_log (LOG_WARNING, "[%s] Receive NO CARRIER\n", PVT_ID(pvt));
 
                                return 0;
@@ -2234,6 +2499,10 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
 			case RES_UNKNOWN:
 				if (ecmd)
 				{
+					if (ecmd->cmd == CMD_USER)
+					{
+						return 0;
+					}
 					switch (ecmd->cmd)
 					{
 						case CMD_AT_CGMI:

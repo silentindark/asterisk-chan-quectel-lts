@@ -262,6 +262,12 @@ typedef struct pvt
 //	struct ast_frame	a_read_frame;			/*!< read frame buffer */
 
 
+	unsigned int		user_cmd_sync_seq;		/*!< monotonically increasing sequence for synchronous CLI AT requests */
+	unsigned int		user_cmd_sync_pending_seq;	/*!< currently pending synchronous CLI AT request sequence */
+	unsigned int		user_cmd_sync_done_seq;	/*!< last completed synchronous CLI AT request sequence */
+	char			*user_cmd_sync_response;	/*!< cached response text for last synchronous CLI AT request */
+	unsigned int		user_cmd_sync_response_truncated:1;	/*!< synchronous CLI AT response was truncated */
+
 	char			dtmf_digit;			/*!< last DTMF digit */
 	struct timeval		dtmf_begin_time;		/*!< time of begin of last DTMF digit */
 	struct timeval		dtmf_end_time;			/*!< time of end of last DTMF digit */

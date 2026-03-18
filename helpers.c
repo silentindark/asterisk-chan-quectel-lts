@@ -13,6 +13,8 @@
 #include <signal.h>				/* SIGURG */
 
 #include <asterisk/callerid.h>			/*  AST_PRES_* */
+#include <asterisk/utils.h>			/* ast_strdup */
+#include <unistd.h>			/* usleep */
 
 #include "helpers.h"
 #include "chan_quectel.h"			/* devices */
@@ -183,6 +185,87 @@ EXPORT_DEF int send_at_command(const char *dev_name, const char *command)
 	int res = at_enqueue_user_cmd(&pvt->sys_chan, command);
 	free_pvt(pvt);
 	return res;
+}
+
+EXPORT_DEF int send_at_command_sync(const char *dev_name, const char *command, unsigned timeout_ms,
+	char **response, int *truncated, int *timed_out)
+{
+	static const unsigned poll_us = 20000U;
+	unsigned int seq;
+	unsigned int waited_ms = 0;
+	int res;
+	struct pvt *pvt;
+
+	if (response)
+		*response = NULL;
+	if (truncated)
+		*truncated = 0;
+	if (timed_out)
+		*timed_out = 0;
+	if (timeout_ms == 0)
+		timeout_ms = 5000;
+
+	pvt = get_pvt(dev_name, 0);
+	if (!pvt) {
+		return -1;
+	}
+	if (pvt->user_cmd_sync_pending_seq != 0) {
+		chan_quectel_err = E_QUEUE;
+		free_pvt(pvt);
+		return -1;
+	}
+
+	seq = ++pvt->user_cmd_sync_seq;
+	if (seq == 0)
+		seq = ++pvt->user_cmd_sync_seq;
+	pvt->user_cmd_sync_pending_seq = seq;
+	pvt->user_cmd_sync_done_seq = 0;
+	pvt->user_cmd_sync_response_truncated = 0;
+	if (pvt->user_cmd_sync_response) {
+		ast_free(pvt->user_cmd_sync_response);
+		pvt->user_cmd_sync_response = NULL;
+	}
+
+	res = at_enqueue_user_cmd_uid(&pvt->sys_chan, command, (int) seq);
+	free_pvt(pvt);
+	if (res != 0) {
+		pvt = get_pvt(dev_name, 0);
+		if (pvt) {
+			if (pvt->user_cmd_sync_pending_seq == seq)
+				pvt->user_cmd_sync_pending_seq = 0;
+			free_pvt(pvt);
+		}
+		return -1;
+	}
+
+	for (;;) {
+		unsigned int done_seq;
+		usleep(poll_us);
+		waited_ms += poll_us / 1000U;
+
+		pvt = get_pvt(dev_name, 0);
+		if (!pvt) {
+			return -1;
+		}
+		done_seq = pvt->user_cmd_sync_done_seq;
+		if (done_seq == seq) {
+			if (response)
+				*response = ast_strdup(pvt->user_cmd_sync_response ? pvt->user_cmd_sync_response : "");
+			if (truncated)
+				*truncated = pvt->user_cmd_sync_response_truncated ? 1 : 0;
+			free_pvt(pvt);
+			return 0;
+		}
+		if (waited_ms >= timeout_ms) {
+			if (pvt->user_cmd_sync_pending_seq == seq)
+				pvt->user_cmd_sync_pending_seq = 0;
+			free_pvt(pvt);
+			if (timed_out)
+				*timed_out = 1;
+			return -2;
+		}
+		free_pvt(pvt);
+	}
 }
 
 EXPORT_DEF int schedule_restart_event(dev_state_t event, restate_time_t when, const char *dev_name)

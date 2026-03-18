@@ -114,6 +114,7 @@ EXPORT_DECL int at_enqueue_reset(struct cpvt *cpvt);
 EXPORT_DECL int at_enqueue_dial(struct cpvt *cpvt, const char *number, int clir);
 EXPORT_DECL int at_enqueue_answer(struct cpvt *cpvt);
 EXPORT_DECL int at_enqueue_user_cmd(struct cpvt *cpvt, const char *input);
+EXPORT_DECL int at_enqueue_user_cmd_uid(struct cpvt *cpvt, const char *input, int uid);
 EXPORT_DECL void at_retrieve_next_sms(struct cpvt *cpvt, at_cmd_suppress_error_t suppress_error);
 EXPORT_DECL int at_enqueue_retrieve_sms(struct cpvt *cpvt, int index, at_cmd_suppress_error_t suppress_error);
 EXPORT_DECL int at_enqueue_delete_sms(struct cpvt *cpvt, int index);
